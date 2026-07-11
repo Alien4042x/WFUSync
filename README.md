@@ -1,43 +1,68 @@
 # WineForge Userspace Sync (WFUSync)
 
-**WineForge Userspace Sync (WFUSync)** is an experimental userspace synchronization backend for Wine on macOS.
+**WineForge Userspace Sync (WFUSync)** is a macOS-focused userspace synchronization backend for Wine.
 
-The original **Wine-NTsync userspace macOS prototype** did not prove reliable enough for real-world use. It was based on the idea of providing NT-style synchronization primitives without a Linux `ntsync` kernel driver, but the first approach was too limited and not suitable for stable game/application testing.
+The original Wine-NTsync userspace macOS prototype did not prove reliable enough for real-world use. Development therefore moved to WFUSync, a new correctness-first implementation designed specifically for Wine on macOS.
 
-Because of that, development has moved to **WFUSync**, a new WineForge-focused implementation.
+WFUSync follows the same general goal as NTSync, MSync, FSync, and ESync: reducing Wine synchronization overhead. It is an independent WineForge implementation and does not attempt to copy another backend 1:1.
 
-WFUSync is inspired by the same goal as Linux `ntsync`, MSync, FSync, and ESync: reducing synchronization overhead in Wine workloads. However, WFUSync is designed specifically for macOS and follows a conservative correctness-first model.
-
-> ⚠️ **Disclaimer**: WFUSync is experimental. It is currently being tested in WineForge-based Wine builds and may still have bugs, missing hot paths, or application-specific issues. Use at your own risk.
+> **Status:** WFUSync v5 is currently a testing release of an experimental backend. Correctness and stress tests pass, but application-specific problems may still exist. Unsupported or sensitive synchronization paths intentionally fall back to the Wine server.
 
 ---
 
 ## Current Status
 
-WFUSync is currently tested with **WineForge / Wine 11.12** on macOS.
+WFUSync v5 is tested with **WineForge / Wine 11.12** on macOS.
 
-Implemented so far:
+Implemented:
 
-- Single-object Event hot path
-  - auto-reset Event wait/set/reset/query
-  - manual-reset Event wait/set/reset/query
-- Single-object Semaphore hot path
-  - wait/release/query
-- Single-object Mutex hot path
-  - wait/release/query
-- WaitAny fast path for supported Event/Semaphore/Mutex cases
-- Limited WaitAll support
-  - currently handled through a correctness-safe server-arbitrated path
-  - not a full client-only hot path
-  - complex or uncertain cases may still fall back to the Wine server
-- Named Event/Semaphore shared-state support for supported cases
-  - not all named-object/server-waiter/unsupported cases are forced into the hot path
-- macOS address-wait backend
-  - `os_sync_wait_on_address` / `os_sync_wake_by_address` on newer macOS
-  - `__ulock_wait` / `__ulock_wake` fallback
-- macOS cache locking uses `os_unfair_lock`
+- Event wait, set, reset, and query
+  - auto-reset and manual-reset Events
+  - named Event support
+- Semaphore wait and release
+  - named Semaphore support
+  - Semaphore query intentionally falls back to the Wine server
+- Mutex wait, release, query, recursion, and abandonment
+  - named and unnamed Mutex support
+- WaitAny for supported Event, Semaphore, and Mutex combinations
+- Atomic userspace WaitAll for supported auto-reset Event, Semaphore, and Mutex combinations
+- Correctness-safe server-assisted WaitAll for manual-reset, contended, or unsupported cases
+- POSIX shared memory using `shm_open()` followed immediately by `shm_unlink()`
+- `os_sync_wait_on_address` and `os_sync_wake_by_address` on newer macOS
+- `__ulock_wait` and `__ulock_wake` fallback on older macOS
+- `os_unfair_lock` for the macOS client cache
 
-Runtime gate:
+Enable WFUSync with:
 
 ```bash
 WINEWFUSYNC=1
+```
+
+---
+
+Stress results include:
+
+```text
+WaitAll registration stress: 1000 iterations, 0 failures
+Competing WaitAll stress: 200 rounds, 400 waits, 0 failures
+```
+
+---
+
+## Microbenchmark Snapshot
+
+Local macOS microbenchmark, 1,000,000 operations per scenario:
+
+| Scenario | WFUSync v5 | CrossOver MSync |
+|---|---:|---:|
+| Auto Event set/wait | 0.000580 ms/op | 0.000666 ms/op |
+| Semaphore release/wait | 0.000607 ms/op | 0.000683 ms/op |
+| Mutex wait/release | 0.000625 ms/op | 0.000686 ms/op |
+| WaitAny auto Events | 0.000627 ms/op | 0.000704 ms/op |
+| WaitAll auto Events | 0.001186 ms/op | 0.001291 ms/op |
+| WaitAll Event + Semaphore | 0.001183 ms/op | 0.001288 ms/op |
+| WaitAll Event + Mutex | 0.001192 ms/op | 0.001294 ms/op |
+
+These are synthetic local microbenchmark results, not independently reproduced application benchmarks. Results can be affected by hardware, macOS version, Wine build, prefix state, process startup, scheduling, and benchmark design. Lower synchronization latency does not guarantee higher FPS or faster performance in every game or application.
+
+Real-world performance depends on whether synchronization is an actual bottleneck. GPU-bound workloads may show little or no difference.
