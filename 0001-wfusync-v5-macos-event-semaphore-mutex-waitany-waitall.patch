@@ -1,0 +1,4735 @@
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index 49bc871..68a0fe1 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -73,6 +73,7 @@ SOURCES = \
+ 	unix/tape.c \
+ 	unix/thread.c \
+ 	unix/virtual.c \
++	unix/wfusync.c \
+ 	unwind.c \
+ 	version.c \
+ 	wcstring.c
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 0221cd2..51fe2fe 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -71,6 +71,7 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "wfusync.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(sync);
+ 
+@@ -84,7 +85,6 @@ static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
+                              (long)(timeout->QuadPart % TICKSPERSEC) );
+ }
+ 
+-
+ /* return a monotonic time counter, in Win32 ticks */
+ static inline ULONGLONG monotonic_counter(void)
+ {
+@@ -680,10 +680,12 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
++            wfusync_cache_inproc_sync( handle, reply->type, reply->access, reply->shm_idx, sync->fd );
+         }
+     }
+     SERVER_END_REQ;
+ 
++    if (ret) wfusync_note_fallback( handle, ret );
+     return ret;
+ }
+ 
+@@ -763,7 +765,13 @@ void close_inproc_sync( HANDLE handle )
+ {
+     struct inproc_sync *cache;
+ 
++    wfusync_drop_handle( handle );
++
++#ifdef __APPLE__
++    if (inproc_device_fd < 0 && !do_wfusync()) return;
++#else
+     if (inproc_device_fd < 0) return;
++#endif
+     if ((cache = get_cached_inproc_sync( handle )))
+     {
+         cache->closed = 1;
+@@ -797,6 +805,31 @@ static NTSTATUS inproc_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATI
+     return ret;
+ }
+ 
++static NTSTATUS warm_wfusync_event_cache( HANDLE handle )
++{
++    struct inproc_sync stack, *sync;
++    NTSTATUS ret;
++
++    if (!do_wfusync() || !wfusync_handle_is_local_event( handle )) return STATUS_NOT_IMPLEMENTED;
++    if (wfusync_get_cached_state( handle, NULL )) return STATUS_NOT_IMPLEMENTED;
++    if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync ))) return ret;
++    release_inproc_sync( sync );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS warm_wfusync_semaphore_cache( HANDLE handle )
++{
++    struct inproc_sync stack, *sync;
++    NTSTATUS ret;
++
++    if (!do_wfusync() || !wfusync_handle_is_local_semaphore( handle )) return STATUS_NOT_IMPLEMENTED;
++    if (wfusync_get_cached_state( handle, NULL )) return STATUS_NOT_IMPLEMENTED;
++    if ((ret = get_inproc_sync( handle, INPROC_SYNC_SEMAPHORE,
++                                SEMAPHORE_MODIFY_STATE, &stack, &sync ))) return ret;
++    release_inproc_sync( sync );
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS inproc_set_event( HANDLE handle, LONG *prev_state )
+ {
+     struct inproc_sync stack, *sync;
+@@ -903,7 +936,48 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
+     int objs[ARRAY_SIZE(syncs)], alert_fd = 0;
+     NTSTATUS ret;
+ 
+-    if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
++    if (inproc_device_fd < 0)
++    {
++#ifdef __APPLE__
++        if (do_wfusync() && count == 1 && type == WaitAny && wfusync_handle_is_local_event( handles[0] ))
++        {
++            ret = get_inproc_sync( handles[0], INPROC_SYNC_EVENT, SYNCHRONIZE, &stack[0], &syncs[0] );
++            if (ret) return ret;
++            release_inproc_sync( syncs[0] );
++        }
++        else if (do_wfusync() && count == 1 && type == WaitAny &&
++                 wfusync_handle_is_local_semaphore( handles[0] ))
++        {
++            ret = get_inproc_sync( handles[0], INPROC_SYNC_SEMAPHORE, SYNCHRONIZE, &stack[0], &syncs[0] );
++            if (ret) return ret;
++            release_inproc_sync( syncs[0] );
++        }
++        else if (do_wfusync() && count == 1 && type == WaitAny &&
++                 wfusync_handle_is_local_mutex( handles[0] ))
++        {
++            ret = get_inproc_sync( handles[0], INPROC_SYNC_MUTEX, SYNCHRONIZE, &stack[0], &syncs[0] );
++            if (ret) return ret;
++            release_inproc_sync( syncs[0] );
++        }
++        else if (do_wfusync() && count > 1 && type == WaitAny)
++        {
++            int i;
++
++            for (i = 0; i < count; i++)
++            {
++                if (!wfusync_handle_is_local_event( handles[i] )) return STATUS_NOT_IMPLEMENTED;
++                ret = get_inproc_sync( handles[i], INPROC_SYNC_EVENT, SYNCHRONIZE, &stack[i], &syncs[i] );
++                if (ret)
++                {
++                    while (i--) release_inproc_sync( syncs[i] );
++                    return ret;
++                }
++            }
++            while (i--) release_inproc_sync( syncs[i] );
++        }
++#endif
++        return STATUS_NOT_IMPLEMENTED;
++    }
+ 
+     assert( count <= ARRAY_SIZE(syncs) );
+     objs[0] = -1;  /* make gcc happy, otherwise it thinks objs is not initialized */
+@@ -990,6 +1064,8 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
+     }
+     SERVER_END_REQ;
+ 
++    if (!ret) wfusync_mark_local_semaphore( *handle );
++
+     free( objattr );
+     return ret;
+ }
+@@ -1031,6 +1107,7 @@ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJEC
+         *handle = wine_server_ptr_handle( reply->handle );
+     }
+     SERVER_END_REQ;
++    if (!ret) wfusync_mark_local_semaphore( *handle );
+     return ret;
+ }
+ 
+@@ -1087,6 +1164,12 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous
+ 
+     TRACE( "handle %p, count %u, prev_count %p\n", handle, count, previous );
+ 
++    if ((ret = wfusync_release_semaphore( handle, count, previous )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++    if (!warm_wfusync_semaphore_cache( handle ) &&
++        (ret = wfusync_release_semaphore( handle, count, previous )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++
+     if ((ret = inproc_release_semaphore( handle, count, previous )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+@@ -1146,6 +1229,8 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     }
+     SERVER_END_REQ;
+ 
++    if (!ret) wfusync_mark_local_event( *handle );
++
+     free( objattr );
+     return ret;
+ }
+@@ -1187,6 +1272,7 @@ NTSTATUS WINAPI NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
+         *handle = wine_server_ptr_handle( reply->handle );
+     }
+     SERVER_END_REQ;
++    if (!ret) wfusync_mark_local_event( *handle );
+     return ret;
+ }
+ 
+@@ -1203,6 +1289,12 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
+ 
+     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+ 
++    if ((ret = wfusync_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++    if (!warm_wfusync_event_cache( handle ) &&
++        (ret = wfusync_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++
+     if ((ret = inproc_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+@@ -1250,6 +1342,12 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
+ 
+     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+ 
++    if ((ret = wfusync_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++    if (!warm_wfusync_event_cache( handle ) &&
++        (ret = wfusync_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++
+     if ((ret = inproc_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+@@ -1357,6 +1455,12 @@ NTSTATUS WINAPI NtQueryEvent( HANDLE handle, EVENT_INFORMATION_CLASS class,
+ 
+     if (len != sizeof(EVENT_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+ 
++    if ((ret = wfusync_query_event( handle, out )) != STATUS_NOT_IMPLEMENTED)
++    {
++        if (!ret && ret_len) *ret_len = sizeof(EVENT_BASIC_INFORMATION);
++        return ret;
++    }
++
+     if ((ret = inproc_query_event( handle, out )) != STATUS_NOT_IMPLEMENTED)
+     {
+         if (!ret && ret_len) *ret_len = sizeof(EVENT_BASIC_INFORMATION);
+@@ -1404,6 +1508,8 @@ NTSTATUS WINAPI NtCreateMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT
+     }
+     SERVER_END_REQ;
+ 
++    if (!ret) wfusync_mark_local_mutex( *handle );
++
+     free( objattr );
+     return ret;
+ }
+@@ -1432,6 +1538,7 @@ NTSTATUS WINAPI NtOpenMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT_A
+         *handle = wine_server_ptr_handle( reply->handle );
+     }
+     SERVER_END_REQ;
++    if (!ret) wfusync_mark_local_mutex( *handle );
+     return ret;
+ }
+ 
+@@ -1445,6 +1552,9 @@ NTSTATUS WINAPI NtReleaseMutant( HANDLE handle, LONG *prev_count )
+ 
+     TRACE( "handle %p, prev_count %p\n", handle, prev_count );
+ 
++    if ((ret = wfusync_release_mutex( handle, prev_count )) != STATUS_NOT_IMPLEMENTED)
++        return ret;
++
+     if ((ret = inproc_release_mutex( handle, prev_count )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+@@ -1478,6 +1588,12 @@ NTSTATUS WINAPI NtQueryMutant( HANDLE handle, MUTANT_INFORMATION_CLASS class,
+ 
+     if (len != sizeof(MUTANT_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+ 
++    if ((ret = wfusync_query_mutex( handle, out )) != STATUS_NOT_IMPLEMENTED)
++    {
++        if (!ret && ret_len) *ret_len = sizeof(MUTANT_BASIC_INFORMATION);
++        return ret;
++    }
++
+     if ((ret = inproc_query_mutex( handle, out )) != STATUS_NOT_IMPLEMENTED)
+     {
+         if (!ret && ret_len) *ret_len = sizeof(MUTANT_BASIC_INFORMATION);
+@@ -2425,12 +2541,26 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+         if (is_pseudo_handle( handles[i] )) return STATUS_INVALID_HANDLE;
+     }
+ 
++    if ((ret = wfusync_wait_multiple( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
+     if ((ret = inproc_wait( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
+         return ret;
+     }
+ 
++#ifdef __APPLE__
++    if ((ret = wfusync_wait_multiple( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++#endif
++
+     if (alertable) flags |= SELECT_ALERTABLE;
+     select_op.wait.op = type == WaitAll ? SELECT_WAIT_ALL : SELECT_WAIT;
+     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
+@@ -2451,12 +2581,48 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+ 
+     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+ 
++    if ((ret = wfusync_wait_event( handle, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
++    if ((ret = wfusync_wait_semaphore( handle, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
++    if ((ret = wfusync_wait_mutex( handle, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
+     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
+         return ret;
+     }
+ 
++    if ((ret = wfusync_wait_event( handle, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
++    if ((ret = wfusync_wait_semaphore( handle, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
++    if ((ret = wfusync_wait_mutex( handle, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
++    {
++        TRACE( "-> %#x\n", ret );
++        return ret;
++    }
++
+     if (alertable) flags |= SELECT_ALERTABLE;
+     select_op.wait.op = SELECT_WAIT;
+     select_op.wait.handles[0] = wine_server_obj_handle( handle );
+diff --git a/dlls/ntdll/unix/syscall.c b/dlls/ntdll/unix/syscall.c
+index dea2cbb..a44a2f2 100644
+--- a/dlls/ntdll/unix/syscall.c
++++ b/dlls/ntdll/unix/syscall.c
+@@ -229,6 +229,15 @@ static void stub_syscall( const char *name )
+ #define SYSCALL_STUB(name) static void name(void) { stub_syscall( #name ); }
+ ALL_SYSCALL_STUBS
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++extern NTSTATUS d3dmetal_sysv_NtResetEvent( HANDLE handle, LONG *prev_state );
++extern NTSTATUS d3dmetal_sysv_NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous );
++extern NTSTATUS d3dmetal_sysv_NtSetEvent( HANDLE handle, LONG *prev_state );
++#define NtResetEvent d3dmetal_sysv_NtResetEvent
++#define NtReleaseSemaphore d3dmetal_sysv_NtReleaseSemaphore
++#define NtSetEvent d3dmetal_sysv_NtSetEvent
++#endif
++
+ static void * const syscalls[] =
+ {
+ #define SYSCALL_ENTRY(id,name,args) name,
+@@ -236,6 +245,12 @@ static void * const syscalls[] =
+ #undef SYSCALL_ENTRY
+ };
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++#undef NtResetEvent
++#undef NtReleaseSemaphore
++#undef NtSetEvent
++#endif
++
+ static BYTE syscall_args[ARRAY_SIZE(syscalls)] =
+ {
+ #define SYSCALL_ENTRY(id,name,args) args,
+diff --git a/dlls/ntdll/unix/wfusync.c b/dlls/ntdll/unix/wfusync.c
+new file mode 100644
+index 0000000..b83c406
+--- /dev/null
++++ b/dlls/ntdll/unix/wfusync.c
+@@ -0,0 +1,1912 @@
++/*
++ * WineForge userspace synchronization client state
++ *
++ * Copyright (C) 2026 Radim Vesely
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#ifdef __WINE_PE_BUILD__
++#error "wfusync.c is for Unix only"
++#endif
++
++#include "config.h"
++
++#include <errno.h>
++#include <limits.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <unistd.h>
++#ifdef __APPLE__
++# include <AvailabilityMacros.h>
++# include <os/lock.h>
++# ifdef MAC_OS_VERSION_14_4
++#  include <os/os_sync_wait_on_address.h>
++# endif
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "wine/server.h"
++#include "wine/unixlib.h"
++#include "wine/debug.h"
++
++#include "wfusync.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wfusync);
++
++#define WFUSYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct wfusync_cache_entry))
++#define WFUSYNC_CACHE_ENTRIES     128
++#define WFUSYNC_TICKS_PER_SEC     10000000LL
++#define WFUSYNC_SPIN_LIMIT        32
++#define WFUSYNC_BLOCKING_FALLBACK_NS 10000000ULL
++
++#define WFUSYNC_KIND_UNKNOWN      0
++#define WFUSYNC_KIND_EVENT        1
++#define WFUSYNC_KIND_MUTEX        2
++#define WFUSYNC_KIND_SEMAPHORE    3
++#define WFUSYNC_KIND_UNSUPPORTED  4
++#define WFUSYNC_TYPE_MASK         0x1fff
++#define WFUSYNC_STATE_LOCKED      0x2000
++#define WFUSYNC_MULTI_WAITERS     0x4000
++#define WFUSYNC_SERVER_WAITERS    0x8000
++
++#ifdef __APPLE__
++#define UL_COMPARE_AND_WAIT        1
++#define UL_COMPARE_AND_WAIT_SHARED 3
++#define ULF_WAKE_ALL               0x00000100
++
++extern int __ulock_wait( uint32_t operation, void *addr, uint64_t value, uint32_t timeout );
++extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
++#endif
++
++struct wfusync_shared_state
++{
++    int            low;
++    int            high;
++    unsigned int   generation;
++    unsigned short type;
++    unsigned short refcount;
++};
++
++struct wfusync_cache_entry
++{
++    HANDLE handle;
++    int valid;
++    int local_event;
++    int local_mutex;
++    int local_semaphore;
++    int signal_unsafe;
++    struct wfusync_fast_state state;
++};
++
++static struct wfusync_cache_entry *wfusync_cache[WFUSYNC_CACHE_ENTRIES];
++static unsigned char *wfusync_handle_kinds[WFUSYNC_CACHE_ENTRIES];
++static unsigned char wfusync_handle_kinds_initial[WFUSYNC_CACHE_BLOCK_SIZE];
++static unsigned char *wfusync_signal_unsafe_indexes;
++static unsigned int wfusync_signal_unsafe_indexes_count;
++static void **wfusync_pages;
++static unsigned int wfusync_pages_count;
++#ifdef __APPLE__
++static os_unfair_lock wfusync_cache_lock = OS_UNFAIR_LOCK_INIT;
++#else
++static pthread_mutex_t wfusync_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
++#endif
++static int do_wfusync_env_cached = -1;
++static int wfusync_shared_fd = -1;
++static __thread unsigned int wfusync_wait_slot_idx;
++static __thread struct wfusync_shared_state *wfusync_wait_slot;
++static long page_size;
++
++static void lock_wfusync_cache(void)
++{
++#ifdef __APPLE__
++    os_unfair_lock_lock( &wfusync_cache_lock );
++#else
++    pthread_mutex_lock( &wfusync_cache_mutex );
++#endif
++}
++
++static void unlock_wfusync_cache(void)
++{
++#ifdef __APPLE__
++    os_unfair_lock_unlock( &wfusync_cache_lock );
++#else
++    pthread_mutex_unlock( &wfusync_cache_mutex );
++#endif
++}
++
++int do_wfusync(void)
++{
++    if (do_wfusync_env_cached == -1)
++    {
++        const char *env = getenv( "WINEWFUSYNC" );
++        do_wfusync_env_cached = (env && atoi( env )) ? 1 : 0;
++    }
++
++    return do_wfusync_env_cached;
++}
++
++static long get_page_size(void)
++{
++    if (!page_size) page_size = sysconf( _SC_PAGESIZE );
++    return page_size;
++}
++
++static BOOL wfusync_handle_to_index( HANDLE handle, unsigned int *entry, unsigned int *idx )
++{
++    unsigned int handle_idx;
++
++    if ((ULONG)(ULONG_PTR)handle >= 0xfffffffa) return FALSE;
++
++    handle_idx = (wine_server_obj_handle( handle ) >> 2) - 1;
++    *entry = handle_idx / WFUSYNC_CACHE_BLOCK_SIZE;
++    *idx = handle_idx % WFUSYNC_CACHE_BLOCK_SIZE;
++    return *entry < WFUSYNC_CACHE_ENTRIES;
++}
++
++static BOOL wfusync_supported_type( int type )
++{
++    switch (type)
++    {
++    case INPROC_SYNC_INTERNAL:
++    case INPROC_SYNC_EVENT:
++    case INPROC_SYNC_MUTEX:
++    case INPROC_SYNC_SEMAPHORE:
++        return TRUE;
++    default:
++        return FALSE;
++    }
++}
++
++static BOOL get_wfusync_cache_entry( HANDLE handle, struct wfusync_cache_entry **entry )
++{
++    unsigned int block, idx;
++
++    if (!wfusync_handle_to_index( handle, &block, &idx )) return FALSE;
++    if (!wfusync_cache[block])
++        wfusync_cache[block] = calloc( WFUSYNC_CACHE_BLOCK_SIZE, sizeof(**wfusync_cache) );
++    if (!wfusync_cache[block]) return FALSE;
++
++    *entry = &wfusync_cache[block][idx];
++    return TRUE;
++}
++
++static unsigned char wfusync_type_to_kind( int type )
++{
++    switch (type)
++    {
++    case INPROC_SYNC_EVENT:
++        return WFUSYNC_KIND_EVENT;
++    case INPROC_SYNC_MUTEX:
++        return WFUSYNC_KIND_MUTEX;
++    case INPROC_SYNC_SEMAPHORE:
++        return WFUSYNC_KIND_SEMAPHORE;
++    default:
++        return WFUSYNC_KIND_UNKNOWN;
++    }
++}
++
++static void wfusync_set_handle_kind( HANDLE handle, unsigned char kind )
++{
++    unsigned int block, idx;
++
++    if (!wfusync_handle_to_index( handle, &block, &idx )) return;
++    if (!wfusync_handle_kinds[block])
++    {
++        if (!block) wfusync_handle_kinds[block] = wfusync_handle_kinds_initial;
++        else wfusync_handle_kinds[block] = calloc( WFUSYNC_CACHE_BLOCK_SIZE, sizeof(**wfusync_handle_kinds) );
++    }
++    if (!wfusync_handle_kinds[block]) return;
++
++    __atomic_store_n( &wfusync_handle_kinds[block][idx], kind, __ATOMIC_RELEASE );
++}
++
++static unsigned char wfusync_get_handle_kind( HANDLE handle )
++{
++    unsigned int block, idx;
++
++    if (!wfusync_handle_to_index( handle, &block, &idx )) return WFUSYNC_KIND_UNKNOWN;
++    if (!wfusync_handle_kinds[block]) return WFUSYNC_KIND_UNKNOWN;
++
++    return __atomic_load_n( &wfusync_handle_kinds[block][idx], __ATOMIC_ACQUIRE );
++}
++
++static BOOL wfusync_shm_idx_signal_unsafe( unsigned int shm_idx )
++{
++    if (!shm_idx || shm_idx >= wfusync_signal_unsafe_indexes_count) return FALSE;
++    return __atomic_load_n( &wfusync_signal_unsafe_indexes[shm_idx], __ATOMIC_ACQUIRE );
++}
++
++static struct wfusync_shared_state *map_wfusync_state( unsigned int shm_idx, int fd )
++{
++    unsigned int page, offset;
++    void **new_pages;
++    void *ptr;
++
++    if (!shm_idx)
++    {
++        TRACE( "invalid index %u\n", shm_idx );
++        return NULL;
++    }
++    if (fd < 0)
++    {
++        TRACE( "fallback shm_idx %u has no shared fd\n", shm_idx );
++        return NULL;
++    }
++
++    page = (shm_idx * sizeof(struct wfusync_shared_state)) / get_page_size();
++    offset = (shm_idx * sizeof(struct wfusync_shared_state)) % get_page_size();
++    if (offset + sizeof(struct wfusync_shared_state) > get_page_size())
++    {
++        TRACE( "invalid index %u crosses page boundary\n", shm_idx );
++        return NULL;
++    }
++
++    if (page >= wfusync_pages_count)
++    {
++        unsigned int new_count = wfusync_pages_count ? wfusync_pages_count * 2 : 16;
++
++        while (page >= new_count) new_count *= 2;
++        if (!(new_pages = realloc( wfusync_pages, new_count * sizeof(*wfusync_pages) )))
++        {
++            TRACE( "fallback shm_idx %u page %u page-cache allocation failed\n", shm_idx, page );
++            return NULL;
++        }
++        memset( new_pages + wfusync_pages_count, 0, (new_count - wfusync_pages_count) * sizeof(*wfusync_pages) );
++        wfusync_pages = new_pages;
++        wfusync_pages_count = new_count;
++    }
++
++    if (!wfusync_pages[page])
++    {
++        ptr = mmap( NULL, get_page_size(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)page * get_page_size() );
++        if (ptr == MAP_FAILED)
++        {
++            TRACE( "fallback shm_idx %u page %u mmap failed errno %d\n", shm_idx, page, errno );
++            return NULL;
++        }
++        wfusync_pages[page] = ptr;
++    }
++
++    return (struct wfusync_shared_state *)((char *)wfusync_pages[page] + offset);
++}
++
++void wfusync_mark_local_event( HANDLE handle )
++{
++    struct wfusync_cache_entry *entry;
++
++    if (!do_wfusync()) return;
++
++    lock_wfusync_cache();
++    if (get_wfusync_cache_entry( handle, &entry ))
++    {
++        if (entry->handle && entry->handle != handle) memset( entry, 0, sizeof(*entry) );
++        entry->handle = handle;
++        entry->local_event = 1;
++        wfusync_set_handle_kind( handle, WFUSYNC_KIND_EVENT );
++    }
++    else TRACE( "fallback handle %p local event marker allocation failed\n", handle );
++    unlock_wfusync_cache();
++}
++
++BOOL wfusync_handle_is_local_event( HANDLE handle )
++{
++    return wfusync_get_handle_kind( handle ) == WFUSYNC_KIND_EVENT;
++}
++
++BOOL wfusync_handle_is_local_mutex( HANDLE handle )
++{
++    return wfusync_get_handle_kind( handle ) == WFUSYNC_KIND_MUTEX;
++}
++
++BOOL wfusync_handle_is_local_semaphore( HANDLE handle )
++{
++    return wfusync_get_handle_kind( handle ) == WFUSYNC_KIND_SEMAPHORE;
++}
++
++void wfusync_mark_local_mutex( HANDLE handle )
++{
++    struct wfusync_cache_entry *entry;
++
++    if (!do_wfusync()) return;
++
++    lock_wfusync_cache();
++    if (get_wfusync_cache_entry( handle, &entry ))
++    {
++        if (entry->handle && entry->handle != handle) memset( entry, 0, sizeof(*entry) );
++        entry->handle = handle;
++        entry->local_mutex = 1;
++        wfusync_set_handle_kind( handle, WFUSYNC_KIND_MUTEX );
++    }
++    else TRACE( "fallback handle %p local mutex marker allocation failed\n", handle );
++    unlock_wfusync_cache();
++}
++
++void wfusync_mark_local_semaphore( HANDLE handle )
++{
++    struct wfusync_cache_entry *entry;
++
++    if (!do_wfusync()) return;
++
++    lock_wfusync_cache();
++    if (get_wfusync_cache_entry( handle, &entry ))
++    {
++        if (entry->handle && entry->handle != handle) memset( entry, 0, sizeof(*entry) );
++        entry->handle = handle;
++        entry->local_semaphore = 1;
++        wfusync_set_handle_kind( handle, WFUSYNC_KIND_SEMAPHORE );
++    }
++    else TRACE( "fallback handle %p local semaphore marker allocation failed\n", handle );
++    unlock_wfusync_cache();
++}
++
++BOOL wfusync_get_cached_state( HANDLE handle, struct wfusync_fast_state *state )
++{
++    unsigned int entry, idx;
++    BOOL ret = FALSE;
++
++    if (!do_wfusync()) return FALSE;
++
++    if (!wfusync_handle_to_index( handle, &entry, &idx ))
++    {
++        TRACE( "unsupported object handle %p; falling back to Wine server\n", handle );
++        return FALSE;
++    }
++
++    lock_wfusync_cache();
++    if (wfusync_cache[entry] && wfusync_cache[entry][idx].valid &&
++        wfusync_cache[entry][idx].handle == handle)
++    {
++        if (state) *state = wfusync_cache[entry][idx].state;
++        ret = TRUE;
++    }
++    unlock_wfusync_cache();
++
++    return ret;
++}
++
++static NTSTATUS get_local_event_state_locked( HANDLE handle, ACCESS_MASK access,
++                                              struct wfusync_cache_entry **entry )
++{
++    struct wfusync_cache_entry *cache;
++
++    if (!get_wfusync_cache_entry( handle, &cache )) return STATUS_NOT_IMPLEMENTED;
++    if (!cache->local_event || !cache->valid || cache->handle != handle || !cache->state.ptr)
++        return STATUS_NOT_IMPLEMENTED;
++    if (cache->state.type != INPROC_SYNC_EVENT)
++    {
++        TRACE( "fallback event handle %p wrong type %d\n", handle, cache->state.type );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++    if ((cache->state.access & access) != access)
++    {
++        TRACE( "fallback event handle %p access %#x missing %#x\n", handle, cache->state.access, access );
++        return STATUS_ACCESS_DENIED;
++    }
++
++    *entry = cache;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS get_local_semaphore_state_locked( HANDLE handle, ACCESS_MASK access,
++                                                  struct wfusync_cache_entry **entry )
++{
++    struct wfusync_cache_entry *cache;
++
++    if (!get_wfusync_cache_entry( handle, &cache )) return STATUS_NOT_IMPLEMENTED;
++    if (!cache->local_semaphore || !cache->valid || cache->handle != handle || !cache->state.ptr)
++        return STATUS_NOT_IMPLEMENTED;
++    if (cache->state.type != INPROC_SYNC_SEMAPHORE)
++    {
++        TRACE( "fallback semaphore handle %p wrong type %d\n", handle, cache->state.type );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++    if ((cache->state.access & access) != access)
++    {
++        TRACE( "fallback semaphore handle %p access %#x missing %#x\n", handle, cache->state.access, access );
++        return STATUS_ACCESS_DENIED;
++    }
++
++    *entry = cache;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS get_local_mutex_state_locked( HANDLE handle, ACCESS_MASK access,
++                                              struct wfusync_cache_entry **entry )
++{
++    struct wfusync_cache_entry *cache;
++
++    if (!get_wfusync_cache_entry( handle, &cache )) return STATUS_NOT_IMPLEMENTED;
++    if (!cache->local_mutex || !cache->valid || cache->handle != handle || !cache->state.ptr)
++        return STATUS_NOT_IMPLEMENTED;
++    if (cache->state.type != INPROC_SYNC_MUTEX)
++    {
++        TRACE( "fallback mutex handle %p wrong type %d\n", handle, cache->state.type );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++    if ((cache->state.access & access) != access)
++    {
++        TRACE( "fallback mutex handle %p access %#x missing %#x\n", handle, cache->state.access, access );
++        return STATUS_ACCESS_DENIED;
++    }
++
++    *entry = cache;
++    return STATUS_SUCCESS;
++}
++
++void wfusync_cache_inproc_sync( HANDLE handle, int type, unsigned int access, unsigned int shm_idx, int fd )
++{
++    unsigned int entry_idx, idx;
++    int local_event = 0;
++    int local_mutex = 0;
++    int local_semaphore = 0;
++    int signal_unsafe = 0;
++    struct wfusync_shared_state *shared;
++    struct wfusync_cache_entry *entry;
++
++    if (!do_wfusync()) return;
++
++    if (!shm_idx)
++    {
++        TRACE( "fallback handle %p type %d access %#x has no WFUSync shm_idx\n", handle, type, access );
++        return;
++    }
++    if (!wfusync_supported_type( type ))
++    {
++        TRACE( "unsupported object handle %p type %d shm_idx %u; falling back to Wine server\n",
++               handle, type, shm_idx );
++        return;
++    }
++    if (!wfusync_handle_to_index( handle, &entry_idx, &idx ))
++    {
++        TRACE( "fallback handle %p shm_idx %u outside WFUSync cache range\n", handle, shm_idx );
++        return;
++    }
++
++    lock_wfusync_cache();
++    if (!(shared = map_wfusync_state( shm_idx, fd )))
++    {
++        unlock_wfusync_cache();
++        return;
++    }
++    if (wfusync_shared_fd < 0) wfusync_shared_fd = dup( fd );
++
++    if (get_wfusync_cache_entry( handle, &entry ))
++    {
++        if (entry->handle == handle)
++        {
++            local_event = entry->local_event;
++            local_mutex = entry->local_mutex;
++            local_semaphore = entry->local_semaphore;
++            signal_unsafe = entry->signal_unsafe;
++        }
++        else memset( entry, 0, sizeof(*entry) );
++        entry->handle = handle;
++        entry->local_event = local_event;
++        entry->local_mutex = local_mutex;
++        entry->local_semaphore = local_semaphore;
++        entry->signal_unsafe = signal_unsafe || wfusync_shm_idx_signal_unsafe( shm_idx );
++        entry->state.type = type;
++        entry->state.access = access;
++        entry->state.shm_idx = shm_idx;
++        entry->state.ptr = shared;
++        entry->state.generation = shared->generation;
++        entry->valid = 1;
++        wfusync_set_handle_kind( handle, wfusync_type_to_kind( type ) );
++    }
++    else TRACE( "fallback handle %p shm_idx %u WFUSync cache allocation failed\n", handle, shm_idx );
++    unlock_wfusync_cache();
++}
++
++void wfusync_drop_handle( HANDLE handle )
++{
++    unsigned int entry, idx;
++
++    if (!do_wfusync()) return;
++    if (!wfusync_handle_to_index( handle, &entry, &idx )) return;
++
++    wfusync_set_handle_kind( handle, WFUSYNC_KIND_UNKNOWN );
++
++    lock_wfusync_cache();
++    if (wfusync_cache[entry] && wfusync_cache[entry][idx].handle == handle)
++    {
++        memset( &wfusync_cache[entry][idx], 0, sizeof(wfusync_cache[entry][idx]) );
++    }
++    unlock_wfusync_cache();
++}
++
++void wfusync_note_fallback( HANDLE handle, NTSTATUS status )
++{
++    if (!do_wfusync()) return;
++    if (status == STATUS_NOT_IMPLEMENTED) wfusync_set_handle_kind( handle, WFUSYNC_KIND_UNSUPPORTED );
++}
++
++static BOOL wfusync_address_wait_supported(void)
++{
++#ifdef __APPLE__
++    return TRUE;
++#else
++    return FALSE;
++#endif
++}
++
++static int compare_timespec( const struct timespec *left, const struct timespec *right );
++
++static unsigned long long timespec_diff_ns( const struct timespec *end, const struct timespec *start )
++{
++    if (compare_timespec( end, start ) <= 0) return 0;
++    return (unsigned long long)(end->tv_sec - start->tv_sec) * 1000000000ULL + end->tv_nsec - start->tv_nsec;
++}
++
++static void ns_to_timespec( unsigned long long ns, struct timespec *timeout )
++{
++    timeout->tv_sec = ns / 1000000000ULL;
++    timeout->tv_nsec = ns % 1000000000ULL;
++}
++
++static NTSTATUS wfusync_wait_address( int *addr, int value, const struct timespec *timeout )
++{
++#ifdef __APPLE__
++    int ret;
++#ifdef MAC_OS_VERSION_14_4
++    if (__builtin_available( macOS 14.4, * ))
++    {
++        if (timeout)
++        {
++            unsigned long long ns_timeout = (unsigned long long)timeout->tv_sec * 1000000000ULL + timeout->tv_nsec;
++
++            if (!ns_timeout) return STATUS_TIMEOUT;
++            ret = os_sync_wait_on_address_with_timeout( addr, (uint64_t)value, sizeof(*addr),
++                                                        OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++                                                        OS_CLOCK_MACH_ABSOLUTE_TIME, ns_timeout );
++        }
++        else ret = os_sync_wait_on_address( addr, (uint64_t)value, sizeof(*addr),
++                                            OS_SYNC_WAIT_ON_ADDRESS_SHARED );
++        if (ret >= 0) return STATUS_SUCCESS;
++        if (errno == ETIMEDOUT) return STATUS_TIMEOUT;
++        if (errno == EINTR || errno == ENOMEM || errno == EFAULT) return STATUS_SUCCESS;
++        TRACE( "fallback address wait addr %p errno %d\n", addr, errno );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++#endif
++
++    if (timeout)
++    {
++        uint64_t usec64 = (uint64_t)timeout->tv_sec * 1000000 + timeout->tv_nsec / 1000;
++        uint32_t usec;
++
++        if (!usec64) return STATUS_TIMEOUT;
++        if (usec64 > UINT_MAX)
++        {
++            TRACE( "fallback address wait addr %p timeout too large for ulock\n", addr );
++            return STATUS_NOT_IMPLEMENTED;
++        }
++        usec = usec64;
++        ret = __ulock_wait( UL_COMPARE_AND_WAIT_SHARED, addr, (uint64_t)value, usec );
++    }
++    else ret = __ulock_wait( UL_COMPARE_AND_WAIT_SHARED, addr, (uint64_t)value, 0 );
++
++    if (ret >= 0) return STATUS_SUCCESS;
++    if (errno == ETIMEDOUT) return STATUS_TIMEOUT;
++    if (errno == EINTR || errno == ENOMEM || errno == EFAULT) return STATUS_SUCCESS;
++    TRACE( "fallback ulock wait addr %p errno %d\n", addr, errno );
++    return STATUS_NOT_IMPLEMENTED;
++#else
++    TRACE( "fallback address wait addr %p unsupported platform\n", addr );
++    return STATUS_NOT_IMPLEMENTED;
++#endif
++}
++
++static int wfusync_atomic_load( int *addr )
++{
++    return __atomic_load_n( addr, __ATOMIC_SEQ_CST );
++}
++
++static unsigned short wfusync_state_type( struct wfusync_shared_state *state )
++{
++    return __atomic_load_n( &state->type, __ATOMIC_SEQ_CST ) & WFUSYNC_TYPE_MASK;
++}
++
++static BOOL wfusync_try_lock_state( struct wfusync_shared_state *state, unsigned short expected_type )
++{
++    unsigned short type = __atomic_load_n( &state->type, __ATOMIC_SEQ_CST );
++
++    if ((type & WFUSYNC_TYPE_MASK) != expected_type ||
++        (type & (WFUSYNC_STATE_LOCKED | WFUSYNC_SERVER_WAITERS)))
++        return FALSE;
++
++    return __atomic_compare_exchange_n( &state->type, &type, type | WFUSYNC_STATE_LOCKED, FALSE,
++                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
++}
++
++static BOOL wfusync_lock_state( struct wfusync_shared_state *state, unsigned short expected_type )
++{
++    unsigned int attempts = 0;
++    unsigned short type;
++
++    for (;;)
++    {
++        if (wfusync_try_lock_state( state, expected_type )) return TRUE;
++        type = __atomic_load_n( &state->type, __ATOMIC_SEQ_CST );
++        if ((type & WFUSYNC_TYPE_MASK) != expected_type || (type & WFUSYNC_SERVER_WAITERS)) return FALSE;
++        if (!(++attempts % 64)) sched_yield();
++    }
++}
++
++static void wfusync_unlock_state( struct wfusync_shared_state *state )
++{
++    __atomic_fetch_and( &state->type, ~WFUSYNC_STATE_LOCKED, __ATOMIC_SEQ_CST );
++}
++
++static BOOL wfusync_has_server_waiters( struct wfusync_shared_state *state )
++{
++    return !!(__atomic_load_n( &state->type, __ATOMIC_SEQ_CST ) &
++              (WFUSYNC_SERVER_WAITERS | WFUSYNC_MULTI_WAITERS));
++}
++
++static BOOL wfusync_has_wine_server_waiters( struct wfusync_shared_state *state )
++{
++    return !!(__atomic_load_n( &state->type, __ATOMIC_SEQ_CST ) & WFUSYNC_SERVER_WAITERS);
++}
++
++static BOOL wfusync_has_multi_waiters( struct wfusync_shared_state *state )
++{
++    return !!(__atomic_load_n( &state->type, __ATOMIC_SEQ_CST ) & WFUSYNC_MULTI_WAITERS);
++}
++
++static BOOL wfusync_entry_signal_hotpath_enabled( const char *op, HANDLE handle,
++                                                  struct wfusync_cache_entry *entry )
++{
++    if (!entry->signal_unsafe && !wfusync_shm_idx_signal_unsafe( entry->state.shm_idx )) return TRUE;
++    entry->signal_unsafe = 1;
++    TRACE( "fallback %s handle %p shm_idx %u; object used by multi-wait\n",
++           op, handle, entry->state.shm_idx );
++    return FALSE;
++}
++
++static BOOL wfusync_handle_kind_matches( HANDLE handle, unsigned char kind )
++{
++    return wfusync_get_handle_kind( handle ) == kind;
++}
++
++static BOOL wfusync_atomic_compare_exchange( int *addr, int expected, int desired )
++{
++    return __atomic_compare_exchange_n( addr, &expected, desired, FALSE, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
++}
++
++static void wfusync_wake_address( int *addr, BOOL wake_all )
++{
++#ifdef __APPLE__
++#ifdef MAC_OS_VERSION_14_4
++    if (__builtin_available( macOS 14.4, * ))
++    {
++        if (wake_all) os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        else os_sync_wake_by_address_any( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        return;
++    }
++#endif
++    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | (wake_all ? ULF_WAKE_ALL : 0), addr, 0 );
++#endif
++}
++
++static void wfusync_wake_waiters( unsigned int shm_idx )
++{
++    SERVER_START_REQ( wake_wfusync_waiters )
++    {
++        req->shm_idx = shm_idx;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
++NTSTATUS wfusync_set_event( HANDLE handle, LONG *prev_state )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    unsigned int generation;
++    int previous;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++    if (!wfusync_handle_kind_matches( handle, WFUSYNC_KIND_EVENT )) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_event_state_locked( handle, EVENT_MODIFY_STATE, &entry )))
++    {
++        unlock_wfusync_cache();
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (!wfusync_entry_signal_hotpath_enabled( "event set", handle, entry ))
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback event set handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_EVENT ))
++    {
++        TRACE( "fallback event set handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++        wfusync_has_server_waiters( state ))
++    {
++        wfusync_unlock_state( state );
++        TRACE( "fallback event set handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    previous = __atomic_exchange_n( &state->low, 1, __ATOMIC_SEQ_CST );
++    if (prev_state) *prev_state = previous;
++    wfusync_unlock_state( state );
++    if (!previous) wfusync_wake_address( &state->low, state->high != 0 );
++    if (!previous && wfusync_has_multi_waiters( state ))
++        wfusync_wake_waiters( entry->state.shm_idx );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wfusync_reset_event( HANDLE handle, LONG *prev_state )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    unsigned int generation;
++    int previous;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++    if (!wfusync_handle_kind_matches( handle, WFUSYNC_KIND_EVENT )) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_event_state_locked( handle, EVENT_MODIFY_STATE, &entry )))
++    {
++        unlock_wfusync_cache();
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (!wfusync_entry_signal_hotpath_enabled( "event reset", handle, entry ))
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback event reset handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_EVENT ))
++    {
++        TRACE( "fallback event reset handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++        wfusync_has_server_waiters( state ))
++    {
++        wfusync_unlock_state( state );
++        TRACE( "fallback event reset handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    previous = __atomic_exchange_n( &state->low, 0, __ATOMIC_SEQ_CST );
++    if (prev_state) *prev_state = previous;
++    wfusync_unlock_state( state );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wfusync_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if (!(ret = get_local_event_state_locked( handle, EVENT_QUERY_STATE, &entry )))
++    {
++        state = entry->state.ptr;
++        info->EventType = state->high ? NotificationEvent : SynchronizationEvent;
++        info->EventState = wfusync_atomic_load( &state->low );
++    }
++    unlock_wfusync_cache();
++
++    return ret;
++}
++
++NTSTATUS wfusync_release_mutex( HANDLE handle, LONG *prev_count )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    unsigned int generation;
++    int tid = GetCurrentThreadId();
++    int count;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++    if (!wfusync_handle_kind_matches( handle, WFUSYNC_KIND_MUTEX )) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_mutex_state_locked( handle, 0, &entry )))
++    {
++        unlock_wfusync_cache();
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback mutex release handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_MUTEX ))
++    {
++        TRACE( "fallback mutex release handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++        wfusync_has_server_waiters( state ))
++    {
++        wfusync_unlock_state( state );
++        TRACE( "fallback mutex release handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    if (__atomic_load_n( &state->low, __ATOMIC_SEQ_CST ) != tid ||
++        !(count = __atomic_load_n( &state->high, __ATOMIC_SEQ_CST )))
++    {
++        wfusync_unlock_state( state );
++        return STATUS_MUTANT_NOT_OWNED;
++    }
++
++    if (prev_count) *prev_count = 1 - count;
++    if (count > 1)
++    {
++        __atomic_store_n( &state->high, count - 1, __ATOMIC_SEQ_CST );
++        wfusync_unlock_state( state );
++        return STATUS_SUCCESS;
++    }
++
++    __atomic_store_n( &state->high, 0, __ATOMIC_SEQ_CST );
++    __atomic_store_n( &state->low, 0, __ATOMIC_SEQ_CST );
++    wfusync_unlock_state( state );
++    wfusync_wake_address( &state->low, FALSE );
++    if (wfusync_has_multi_waiters( state ))
++        wfusync_wake_waiters( entry->state.shm_idx );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wfusync_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *info )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    int owner, count;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++    if (!wfusync_handle_kind_matches( handle, WFUSYNC_KIND_MUTEX )) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if (!(ret = get_local_mutex_state_locked( handle, MUTANT_QUERY_STATE, &entry )))
++    {
++        state = entry->state.ptr;
++        if (!wfusync_lock_state( state, INPROC_SYNC_MUTEX ))
++            ret = STATUS_NOT_IMPLEMENTED;
++        else
++        {
++            owner = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++            count = owner < 0 ? 0 : __atomic_load_n( &state->high, __ATOMIC_SEQ_CST );
++            info->CurrentCount = 1 - count;
++            info->OwnedByCaller = owner == (int)GetCurrentThreadId();
++            info->AbandonedState = owner < 0;
++            wfusync_unlock_state( state );
++        }
++    }
++    unlock_wfusync_cache();
++
++    return ret;
++}
++
++NTSTATUS wfusync_release_semaphore( HANDLE handle, ULONG count, ULONG *previous )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    unsigned int generation;
++    int old_count, new_count;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++    if (!wfusync_handle_kind_matches( handle, WFUSYNC_KIND_SEMAPHORE )) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_semaphore_state_locked( handle, SEMAPHORE_MODIFY_STATE, &entry )))
++    {
++        unlock_wfusync_cache();
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (!wfusync_entry_signal_hotpath_enabled( "semaphore release", handle, entry ))
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback semaphore release handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_SEMAPHORE ))
++    {
++        TRACE( "fallback semaphore release handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++        wfusync_has_server_waiters( state ))
++    {
++        wfusync_unlock_state( state );
++        TRACE( "fallback semaphore release handle %p stale or server-owned state\n", handle );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    do
++    {
++        old_count = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++        if ((ULONG)old_count + count < (ULONG)old_count || (ULONG)old_count + count > (ULONG)state->high)
++        {
++            TRACE( "semaphore release handle %p count %u current %d max %d exceeds limit\n",
++                   handle, count, old_count, state->high );
++            wfusync_unlock_state( state );
++            return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
++        }
++        new_count = old_count + count;
++    } while (!__atomic_compare_exchange_n( &state->low, &old_count, new_count, FALSE,
++                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
++
++    if (previous) *previous = old_count;
++    wfusync_unlock_state( state );
++    if (!old_count) wfusync_wake_address( &state->low, count > 1 );
++    if (!old_count && wfusync_has_multi_waiters( state ))
++        wfusync_wake_waiters( entry->state.shm_idx );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wfusync_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATION *info )
++{
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++static NTSTATUS consume_auto_event_state( struct wfusync_shared_state *state )
++{
++    if (!wfusync_atomic_load( &state->low )) return STATUS_TIMEOUT;
++    if (state->high) return STATUS_NOT_IMPLEMENTED;
++    if (!wfusync_atomic_compare_exchange( &state->low, 1, 0 )) return STATUS_TIMEOUT;
++    return STATUS_WAIT_0;
++}
++
++static NTSTATUS consume_event_state( struct wfusync_shared_state *state )
++{
++    NTSTATUS ret;
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_EVENT )) return STATUS_NOT_IMPLEMENTED;
++    ret = !wfusync_atomic_load( &state->low ) ? STATUS_TIMEOUT :
++          state->high ? STATUS_WAIT_0 : consume_auto_event_state( state );
++    wfusync_unlock_state( state );
++    return ret;
++}
++
++static NTSTATUS consume_semaphore_state( struct wfusync_shared_state *state )
++{
++    int count;
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_SEMAPHORE )) return STATUS_NOT_IMPLEMENTED;
++
++    do
++    {
++        count = wfusync_atomic_load( &state->low );
++        if (count <= 0)
++        {
++            wfusync_unlock_state( state );
++            return STATUS_TIMEOUT;
++        }
++    } while (!__atomic_compare_exchange_n( &state->low, &count, count - 1, FALSE,
++                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
++
++    wfusync_unlock_state( state );
++    return STATUS_WAIT_0;
++}
++
++static NTSTATUS consume_mutex_state_locked( struct wfusync_shared_state *state, int tid )
++{
++    int owner, count;
++
++    owner = wfusync_atomic_load( &state->low );
++    count = wfusync_atomic_load( &state->high );
++
++    if (owner == tid)
++    {
++        if (count == INT_MAX) return STATUS_NOT_IMPLEMENTED;
++        __atomic_store_n( &state->high, count + 1, __ATOMIC_SEQ_CST );
++        return STATUS_WAIT_0;
++    }
++
++    if (!owner || owner < 0)
++    {
++        __atomic_store_n( &state->low, tid, __ATOMIC_SEQ_CST );
++        __atomic_store_n( &state->high, 1, __ATOMIC_SEQ_CST );
++        if (owner < 0)
++        {
++            __atomic_add_fetch( &state->generation, 1, __ATOMIC_SEQ_CST );
++            return STATUS_ABANDONED;
++        }
++        return STATUS_WAIT_0;
++    }
++
++    return STATUS_TIMEOUT;
++}
++
++static NTSTATUS consume_mutex_state( struct wfusync_shared_state *state, int tid )
++{
++    NTSTATUS ret;
++
++    if (!wfusync_lock_state( state, INPROC_SYNC_MUTEX )) return STATUS_NOT_IMPLEMENTED;
++    ret = consume_mutex_state_locked( state, tid );
++    wfusync_unlock_state( state );
++    return ret;
++}
++
++static void wfusync_refresh_cache_generation( HANDLE handle, struct wfusync_shared_state *state )
++{
++    struct wfusync_cache_entry *entry;
++
++    lock_wfusync_cache();
++    if (get_wfusync_cache_entry( handle, &entry ) && entry->handle == handle &&
++        entry->valid && entry->state.ptr == state)
++        entry->state.generation = __atomic_load_n( &state->generation, __ATOMIC_SEQ_CST );
++    unlock_wfusync_cache();
++}
++
++static void get_relative_timeout_abs( const LARGE_INTEGER *timeout, struct timespec *abstime )
++{
++    LONGLONG ticks = -timeout->QuadPart;
++    struct timeval now;
++    LONGLONG nsec;
++
++    gettimeofday( &now, NULL );
++    nsec = (LONGLONG)now.tv_usec * 1000 + (ticks % WFUSYNC_TICKS_PER_SEC) * 100;
++    abstime->tv_sec = now.tv_sec + ticks / WFUSYNC_TICKS_PER_SEC + nsec / 1000000000;
++    abstime->tv_nsec = nsec % 1000000000;
++}
++
++static void get_now_abs( struct timespec *now )
++{
++    struct timeval tv;
++
++    gettimeofday( &tv, NULL );
++    now->tv_sec = tv.tv_sec;
++    now->tv_nsec = tv.tv_usec * 1000;
++}
++
++static int compare_timespec( const struct timespec *left, const struct timespec *right )
++{
++    if (left->tv_sec != right->tv_sec) return left->tv_sec < right->tv_sec ? -1 : 1;
++    if (left->tv_nsec != right->tv_nsec) return left->tv_nsec < right->tv_nsec ? -1 : 1;
++    return 0;
++}
++
++static BOOL wfusync_adaptive_spin( unsigned int *attempts )
++{
++    if (*attempts >= WFUSYNC_SPIN_LIMIT) return FALSE;
++
++    (*attempts)++;
++    return TRUE;
++}
++
++NTSTATUS wfusync_wait_event( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    struct timespec deadline;
++    unsigned int attempts = 0;
++    unsigned int generation;
++    unsigned char kind;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++
++    kind = wfusync_get_handle_kind( handle );
++    if (kind && kind != WFUSYNC_KIND_EVENT) return STATUS_NOT_IMPLEMENTED;
++    if (alertable)
++        return kind == WFUSYNC_KIND_EVENT ? STATUS_NOT_IMPLEMENTED
++                                          : STATUS_NOT_IMPLEMENTED;
++    if (timeout && timeout->QuadPart > 0)
++        return kind == WFUSYNC_KIND_EVENT ? STATUS_NOT_IMPLEMENTED
++                                          : STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_event_state_locked( handle, SYNCHRONIZE, &entry )))
++    {
++        unlock_wfusync_cache();
++        if (ret == STATUS_NOT_IMPLEMENTED && kind == WFUSYNC_KIND_EVENT)
++            return STATUS_NOT_IMPLEMENTED;
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (!wfusync_entry_signal_hotpath_enabled( "event wait", handle, entry ))
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback event wait handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (!wfusync_address_wait_supported())
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    if ((ret = consume_event_state( state )) == STATUS_WAIT_0)
++    {
++        return ret;
++    }
++    if (timeout && !timeout->QuadPart)
++    {
++        return STATUS_TIMEOUT;
++    }
++
++    if (timeout) get_relative_timeout_abs( timeout, &deadline );
++
++    for (;;)
++    {
++        struct timespec now, wait_timeout;
++        struct timespec *wait_timeout_ptr = NULL;
++        unsigned long long ns;
++
++        if (wfusync_adaptive_spin( &attempts )) continue;
++        if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++            wfusync_state_type( state ) != INPROC_SYNC_EVENT ||
++            wfusync_has_server_waiters( state ))
++        {
++            TRACE( "fallback event wait handle %p stale or server-owned state\n", handle );
++            return STATUS_NOT_IMPLEMENTED;
++        }
++        if ((ret = consume_event_state( state )) == STATUS_WAIT_0) break;
++        if (timeout)
++        {
++            get_now_abs( &now );
++            ns = timespec_diff_ns( &deadline, &now );
++            if (!ns)
++            {
++                return STATUS_TIMEOUT;
++            }
++            ns_to_timespec( ns, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        else
++        {
++            ns_to_timespec( WFUSYNC_BLOCKING_FALLBACK_NS, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        ret = wfusync_wait_address( &state->low, 0, wait_timeout_ptr );
++        if (ret == STATUS_TIMEOUT)
++        {
++            if (!timeout) return STATUS_NOT_IMPLEMENTED;
++            break;
++        }
++        if (ret == STATUS_NOT_IMPLEMENTED)
++            return STATUS_NOT_IMPLEMENTED;
++        if (ret != STATUS_SUCCESS) return ret;
++    }
++
++    return ret;
++}
++
++NTSTATUS wfusync_wait_mutex( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    struct timespec deadline;
++    unsigned int attempts = 0;
++    unsigned int generation;
++    unsigned char kind;
++    int tid = GetCurrentThreadId();
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++
++    kind = wfusync_get_handle_kind( handle );
++    if (kind && kind != WFUSYNC_KIND_MUTEX) return STATUS_NOT_IMPLEMENTED;
++    if (alertable)
++        return kind == WFUSYNC_KIND_MUTEX ? STATUS_NOT_IMPLEMENTED
++                                          : STATUS_NOT_IMPLEMENTED;
++    if (timeout && timeout->QuadPart > 0)
++        return kind == WFUSYNC_KIND_MUTEX ? STATUS_NOT_IMPLEMENTED
++                                          : STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_mutex_state_locked( handle, SYNCHRONIZE, &entry )))
++    {
++        unlock_wfusync_cache();
++        if (ret == STATUS_NOT_IMPLEMENTED && kind == WFUSYNC_KIND_MUTEX)
++            return STATUS_NOT_IMPLEMENTED;
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback mutex wait handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (!wfusync_address_wait_supported())
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    ret = consume_mutex_state( state, tid );
++    if (ret == STATUS_WAIT_0 || ret == STATUS_ABANDONED)
++    {
++        if (ret == STATUS_ABANDONED) wfusync_refresh_cache_generation( handle, state );
++        return ret;
++    }
++    if (ret != STATUS_TIMEOUT) return ret;
++    if (timeout && !timeout->QuadPart)
++    {
++        return STATUS_TIMEOUT;
++    }
++
++    if (timeout) get_relative_timeout_abs( timeout, &deadline );
++
++    for (;;)
++    {
++        struct timespec now, wait_timeout;
++        struct timespec *wait_timeout_ptr = NULL;
++        unsigned long long ns;
++        int owner;
++
++        if (wfusync_adaptive_spin( &attempts )) continue;
++        if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++            wfusync_state_type( state ) != INPROC_SYNC_MUTEX ||
++            wfusync_has_server_waiters( state ))
++        {
++            TRACE( "fallback mutex wait handle %p stale or server-owned state\n", handle );
++            return STATUS_NOT_IMPLEMENTED;
++        }
++        ret = consume_mutex_state( state, tid );
++        if (ret == STATUS_WAIT_0 || ret == STATUS_ABANDONED)
++        {
++            if (ret == STATUS_ABANDONED) wfusync_refresh_cache_generation( handle, state );
++            break;
++        }
++        if (ret != STATUS_TIMEOUT) return ret;
++        if (timeout)
++        {
++            get_now_abs( &now );
++            ns = timespec_diff_ns( &deadline, &now );
++            if (!ns)
++            {
++                return STATUS_TIMEOUT;
++            }
++            ns_to_timespec( ns, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        else
++        {
++            ns_to_timespec( WFUSYNC_BLOCKING_FALLBACK_NS, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++
++        owner = wfusync_atomic_load( &state->low );
++        ret = wfusync_wait_address( &state->low, owner, wait_timeout_ptr );
++        if (ret == STATUS_TIMEOUT)
++        {
++            if (!timeout) return STATUS_NOT_IMPLEMENTED;
++            return STATUS_TIMEOUT;
++        }
++        if (ret == STATUS_NOT_IMPLEMENTED)
++            return STATUS_NOT_IMPLEMENTED;
++        if (ret != STATUS_SUCCESS) return ret;
++    }
++
++    return ret;
++}
++
++NTSTATUS wfusync_wait_semaphore( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *state;
++    struct timespec deadline;
++    unsigned int attempts = 0;
++    unsigned int generation;
++    unsigned char kind;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++
++    kind = wfusync_get_handle_kind( handle );
++    if (kind && kind != WFUSYNC_KIND_SEMAPHORE) return STATUS_NOT_IMPLEMENTED;
++    if (alertable)
++        return kind == WFUSYNC_KIND_SEMAPHORE ? STATUS_NOT_IMPLEMENTED
++                                              : STATUS_NOT_IMPLEMENTED;
++    if (timeout && timeout->QuadPart > 0)
++        return kind == WFUSYNC_KIND_SEMAPHORE ? STATUS_NOT_IMPLEMENTED
++                                              : STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    if ((ret = get_local_semaphore_state_locked( handle, SYNCHRONIZE, &entry )))
++    {
++        unlock_wfusync_cache();
++        if (ret == STATUS_NOT_IMPLEMENTED && kind == WFUSYNC_KIND_SEMAPHORE)
++            return STATUS_NOT_IMPLEMENTED;
++        return ret;
++    }
++    state = entry->state.ptr;
++    generation = entry->state.generation;
++    if (!wfusync_entry_signal_hotpath_enabled( "semaphore wait", handle, entry ))
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (wfusync_has_server_waiters( state ))
++    {
++        TRACE( "fallback semaphore wait handle %p has server waiters\n", handle );
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (!wfusync_address_wait_supported())
++    {
++        unlock_wfusync_cache();
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    unlock_wfusync_cache();
++
++    if ((ret = consume_semaphore_state( state )) == STATUS_WAIT_0)
++    {
++        return ret;
++    }
++    if (timeout && !timeout->QuadPart)
++    {
++        return STATUS_TIMEOUT;
++    }
++
++    if (timeout) get_relative_timeout_abs( timeout, &deadline );
++
++    for (;;)
++    {
++        struct timespec now, wait_timeout;
++        struct timespec *wait_timeout_ptr = NULL;
++        unsigned long long ns;
++
++        if (wfusync_adaptive_spin( &attempts )) continue;
++        if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation ||
++            wfusync_state_type( state ) != INPROC_SYNC_SEMAPHORE ||
++            wfusync_has_server_waiters( state ))
++        {
++            TRACE( "fallback semaphore wait handle %p stale or server-owned state\n", handle );
++            return STATUS_NOT_IMPLEMENTED;
++        }
++        if ((ret = consume_semaphore_state( state )) == STATUS_WAIT_0) break;
++        if (timeout)
++        {
++            get_now_abs( &now );
++            ns = timespec_diff_ns( &deadline, &now );
++            if (!ns)
++            {
++                return STATUS_TIMEOUT;
++            }
++            ns_to_timespec( ns, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        else
++        {
++            ns_to_timespec( WFUSYNC_BLOCKING_FALLBACK_NS, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        ret = wfusync_wait_address( &state->low, 0, wait_timeout_ptr );
++        if (ret == STATUS_TIMEOUT)
++        {
++            if (!timeout) return STATUS_NOT_IMPLEMENTED;
++            break;
++        }
++        if (ret == STATUS_NOT_IMPLEMENTED)
++            return STATUS_NOT_IMPLEMENTED;
++        if (ret != STATUS_SUCCESS) return ret;
++    }
++
++    return ret;
++}
++
++static NTSTATUS get_wfusync_wait_slot(void)
++{
++    NTSTATUS ret = STATUS_SUCCESS;
++
++    if (wfusync_wait_slot) return STATUS_SUCCESS;
++    if (wfusync_shared_fd < 0)
++    {
++        TRACE( "fallback multiple wait no shared fd for wait slot\n" );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    SERVER_START_REQ( get_wfusync_wait_slot )
++    {
++        ret = wine_server_call( req );
++        if (!ret) wfusync_wait_slot_idx = reply->shm_idx;
++    }
++    SERVER_END_REQ;
++
++    if (ret) return ret;
++    if (!wfusync_wait_slot_idx) return STATUS_NOT_IMPLEMENTED;
++
++    lock_wfusync_cache();
++    wfusync_wait_slot = map_wfusync_state( wfusync_wait_slot_idx, wfusync_shared_fd );
++    unlock_wfusync_cache();
++
++    return wfusync_wait_slot ? STATUS_SUCCESS : STATUS_NOT_IMPLEMENTED;
++}
++
++static NTSTATUS register_wfusync_wait( const unsigned int *shm_idxs, unsigned int count )
++{
++    NTSTATUS ret;
++
++    SERVER_START_REQ( register_wfusync_wait )
++    {
++        req->slot_idx = wfusync_wait_slot_idx;
++        wine_server_add_data( req, shm_idxs, count * sizeof(*shm_idxs) );
++        ret = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
++    return ret;
++}
++
++static void unregister_wfusync_wait(void)
++{
++    SERVER_START_REQ( unregister_wfusync_wait )
++    {
++        req->slot_idx = wfusync_wait_slot_idx;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
++static NTSTATUS try_wait_all_local( struct wfusync_shared_state **states,
++                                    const unsigned int *shm_idxs,
++                                    const unsigned int *generations,
++                                    const unsigned short *types, DWORD count )
++{
++    DWORD order[64];
++    DWORD i, j, locked = 0;
++    int abandoned = 0;
++    int tid = GetCurrentThreadId();
++    NTSTATUS ret = STATUS_NOT_IMPLEMENTED;
++
++    for (i = 0; i < count; i++)
++    {
++        order[i] = i;
++        for (j = i; j && shm_idxs[order[j - 1]] > shm_idxs[order[j]]; j--)
++        {
++            DWORD swap = order[j - 1];
++            order[j - 1] = order[j];
++            order[j] = swap;
++        }
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        DWORD index = order[i];
++
++        if (i && shm_idxs[order[i - 1]] == shm_idxs[index]) goto done;
++        if (types[index] != INPROC_SYNC_EVENT && types[index] != INPROC_SYNC_SEMAPHORE &&
++            types[index] != INPROC_SYNC_MUTEX)
++            goto done;
++        if (!wfusync_lock_state( states[index], types[index] )) goto done;
++        locked++;
++
++        if (__atomic_load_n( &states[index]->generation, __ATOMIC_SEQ_CST ) != generations[index])
++            goto done;
++        if (types[index] == INPROC_SYNC_EVENT && states[index]->high) goto done;
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        if ((types[i] == INPROC_SYNC_EVENT && !states[i]->low) ||
++            (types[i] == INPROC_SYNC_SEMAPHORE && states[i]->low <= 0) ||
++            (types[i] == INPROC_SYNC_MUTEX && states[i]->low > 0 && states[i]->low != tid))
++        {
++            ret = STATUS_TIMEOUT;
++            goto done;
++        }
++        if (types[i] == INPROC_SYNC_MUTEX && states[i]->low == tid && states[i]->high == INT_MAX)
++            goto done;
++        if (types[i] == INPROC_SYNC_MUTEX && states[i]->low < 0) abandoned = 1;
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        if (types[i] == INPROC_SYNC_EVENT) states[i]->low = 0;
++        else if (types[i] == INPROC_SYNC_SEMAPHORE) states[i]->low--;
++        else
++        {
++            NTSTATUS status = consume_mutex_state_locked( states[i], tid );
++
++            if (status == STATUS_ABANDONED) abandoned = 1;
++            else if (status != STATUS_WAIT_0) goto done;
++        }
++    }
++    ret = abandoned ? STATUS_ABANDONED_WAIT_0 : STATUS_WAIT_0;
++
++done:
++    while (locked) wfusync_unlock_state( states[order[--locked]] );
++    return ret;
++}
++
++static NTSTATUS try_wait_all_wfusync( const unsigned int *entries, DWORD count, unsigned int slot_idx )
++{
++    NTSTATUS ret;
++    SERVER_START_REQ( try_wait_all_wfusync )
++    {
++        req->tid = GetCurrentThreadId();
++        req->slot_idx = slot_idx;
++        wine_server_add_data( req, entries, count * 3 * sizeof(*entries) );
++        ret = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    return ret;
++}
++
++static NTSTATUS consume_waitany_states( const HANDLE *handles, struct wfusync_shared_state **states,
++                                        const unsigned int *generations, const unsigned short *types,
++                                        DWORD count )
++{
++    int tid = GetCurrentThreadId();
++    DWORD i;
++    NTSTATUS ret;
++
++    for (i = 0; i < count; i++)
++    {
++        if (__atomic_load_n( &states[i]->generation, __ATOMIC_SEQ_CST ) != generations[i] ||
++            wfusync_state_type( states[i] ) != types[i])
++        {
++            TRACE( "fallback multiple wait stale state index %u\n", i );
++            return STATUS_NOT_IMPLEMENTED;
++        }
++
++        switch (types[i])
++        {
++        case INPROC_SYNC_EVENT:
++            ret = consume_event_state( states[i] );
++            break;
++        case INPROC_SYNC_SEMAPHORE:
++            ret = consume_semaphore_state( states[i] );
++            break;
++        case INPROC_SYNC_MUTEX:
++            ret = consume_mutex_state( states[i], tid );
++            if (ret == STATUS_ABANDONED) wfusync_refresh_cache_generation( handles[i], states[i] );
++            break;
++        default:
++            return STATUS_NOT_IMPLEMENTED;
++        }
++
++        if (ret == STATUS_WAIT_0)
++        {
++            return STATUS_WAIT_0 + i;
++        }
++        if (ret == STATUS_ABANDONED)
++        {
++            return STATUS_ABANDONED_WAIT_0 + i;
++        }
++        if (ret != STATUS_TIMEOUT) return ret;
++    }
++
++    return STATUS_TIMEOUT;
++}
++
++static BOOL wfusync_waitall_ret_satisfied( NTSTATUS ret, DWORD count )
++{
++    return ret == STATUS_WAIT_0 || (ret >= STATUS_ABANDONED_WAIT_0 && ret < STATUS_ABANDONED_WAIT_0 + count);
++}
++
++static void refresh_waitall_mutex_generations( const HANDLE *handles, struct wfusync_shared_state **states,
++                                               const unsigned short *types, DWORD count )
++{
++    DWORD i;
++
++    for (i = 0; i < count; i++)
++        if (types[i] == INPROC_SYNC_MUTEX) wfusync_refresh_cache_generation( handles[i], states[i] );
++}
++
++NTSTATUS wfusync_wait_multiple( DWORD count, const HANDLE *handles, WAIT_TYPE type,
++                                BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    struct wfusync_cache_entry *entry;
++    struct wfusync_shared_state *states[64];
++    unsigned int shm_idxs[64], generations[64];
++    unsigned short types[64];
++    struct timespec deadline;
++    DWORD i;
++    NTSTATUS ret;
++
++    if (!do_wfusync()) return STATUS_NOT_IMPLEMENTED;
++
++    if (type != WaitAny && type != WaitAll)
++        return STATUS_NOT_IMPLEMENTED;
++    if (alertable)
++    {
++        TRACE( "fallback multiple wait alertable\n" );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (timeout && timeout->QuadPart > 0)
++    {
++        TRACE( "fallback multiple wait absolute timeout %s\n", wine_dbgstr_longlong(timeout->QuadPart) );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (count < 2 || count > ARRAY_SIZE(states))
++    {
++        TRACE( "fallback multiple wait unsupported count %lu\n", (unsigned long)count );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (type == WaitAny && !wfusync_address_wait_supported())
++    {
++        TRACE( "fallback waitany address wait unsupported\n" );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    lock_wfusync_cache();
++    for (i = 0; i < count; i++)
++    {
++        struct wfusync_shared_state *state;
++        unsigned char kind = wfusync_get_handle_kind( handles[i] );
++
++        switch (kind)
++        {
++        case WFUSYNC_KIND_EVENT:
++            ret = get_local_event_state_locked( handles[i], SYNCHRONIZE, &entry );
++            break;
++        case WFUSYNC_KIND_SEMAPHORE:
++            ret = get_local_semaphore_state_locked( handles[i], SYNCHRONIZE, &entry );
++            break;
++        case WFUSYNC_KIND_MUTEX:
++            ret = get_local_mutex_state_locked( handles[i], SYNCHRONIZE, &entry );
++            break;
++        default:
++            TRACE( "fallback multiple wait handle %p unknown kind %u\n", handles[i], kind );
++            ret = STATUS_NOT_IMPLEMENTED;
++            break;
++        }
++        if (ret)
++        {
++            unlock_wfusync_cache();
++            if (ret == STATUS_NOT_IMPLEMENTED)
++                return STATUS_NOT_IMPLEMENTED;
++            return ret;
++        }
++        state = entry->state.ptr;
++        if (__atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != entry->state.generation)
++        {
++            if (entry->state.type == INPROC_SYNC_MUTEX &&
++                wfusync_state_type( state ) == INPROC_SYNC_MUTEX && wfusync_atomic_load( &state->low ) < 0)
++                entry->state.generation = __atomic_load_n( &state->generation, __ATOMIC_SEQ_CST );
++            else
++            {
++                TRACE( "fallback multiple wait handle %p has stale generation\n", handles[i] );
++                unlock_wfusync_cache();
++                return STATUS_NOT_IMPLEMENTED;
++            }
++        }
++        if (type == WaitAll ? wfusync_has_wine_server_waiters( state ) : wfusync_has_server_waiters( state ))
++        {
++            TRACE( "fallback multiple wait handle %p has server waiters\n", handles[i] );
++            unlock_wfusync_cache();
++            return STATUS_NOT_IMPLEMENTED;
++        }
++        states[i] = state;
++        shm_idxs[i] = entry->state.shm_idx;
++        generations[i] = entry->state.generation;
++        types[i] = entry->state.type;
++    }
++    unlock_wfusync_cache();
++
++    if (type == WaitAll)
++    {
++        unsigned int entries[ARRAY_SIZE(states) * 3];
++
++        ret = try_wait_all_local( states, shm_idxs, generations, types, count );
++        if (ret == STATUS_WAIT_0 || ret == STATUS_ABANDONED_WAIT_0)
++        {
++            if (ret == STATUS_ABANDONED_WAIT_0)
++                refresh_waitall_mutex_generations( handles, states, types, count );
++            return ret;
++        }
++        if (ret == STATUS_TIMEOUT && timeout && !timeout->QuadPart)
++        {
++            return ret;
++        }
++
++        for (i = 0; i < count; i++)
++        {
++            entries[i * 3] = shm_idxs[i];
++            entries[i * 3 + 1] = generations[i];
++            entries[i * 3 + 2] = types[i];
++        }
++        if (timeout && !timeout->QuadPart)
++        {
++            ret = try_wait_all_wfusync( entries, count, 0 );
++            if (wfusync_waitall_ret_satisfied( ret, count ))
++            {
++                if (ret >= STATUS_ABANDONED_WAIT_0)
++                    refresh_waitall_mutex_generations( handles, states, types, count );
++                return ret;
++            }
++            if (ret == STATUS_TIMEOUT)
++            {
++                return STATUS_TIMEOUT;
++            }
++            return ret == STATUS_NOT_IMPLEMENTED ? STATUS_NOT_IMPLEMENTED : ret;
++        }
++
++        if ((ret = get_wfusync_wait_slot()))
++            return ret == STATUS_NOT_IMPLEMENTED ? STATUS_NOT_IMPLEMENTED : ret;
++        if (timeout) get_relative_timeout_abs( timeout, &deadline );
++
++        for (;;)
++        {
++            struct timespec now, wait_timeout;
++            struct timespec *wait_timeout_ptr = NULL;
++            unsigned long long ns;
++
++            ret = try_wait_all_wfusync( entries, count, wfusync_wait_slot_idx );
++            if (wfusync_waitall_ret_satisfied( ret, count ))
++            {
++                if (ret >= STATUS_ABANDONED_WAIT_0)
++                    refresh_waitall_mutex_generations( handles, states, types, count );
++                return ret;
++            }
++            if (ret != STATUS_PENDING)
++            {
++                return ret == STATUS_NOT_IMPLEMENTED ? STATUS_NOT_IMPLEMENTED : ret;
++            }
++
++            if (timeout)
++            {
++                get_now_abs( &now );
++                ns = timespec_diff_ns( &deadline, &now );
++                if (!ns)
++                {
++                    unregister_wfusync_wait();
++                    return STATUS_TIMEOUT;
++                }
++                ns_to_timespec( ns, &wait_timeout );
++                wait_timeout_ptr = &wait_timeout;
++            }
++            ret = wfusync_wait_address( &wfusync_wait_slot->low, 1, wait_timeout_ptr );
++
++            if (ret == STATUS_TIMEOUT)
++            {
++                unregister_wfusync_wait();
++                return STATUS_TIMEOUT;
++            }
++            if (ret == STATUS_NOT_IMPLEMENTED)
++            {
++                unregister_wfusync_wait();
++                return STATUS_NOT_IMPLEMENTED;
++            }
++            if (ret != STATUS_SUCCESS)
++            {
++                unregister_wfusync_wait();
++                return ret;
++            }
++        }
++    }
++
++    ret = consume_waitany_states( handles, states, generations, types, count );
++    if (ret != STATUS_TIMEOUT)
++    {
++        if (ret == STATUS_NOT_IMPLEMENTED)
++            return STATUS_NOT_IMPLEMENTED;
++        return ret;
++    }
++    if (timeout && !timeout->QuadPart)
++    {
++        return STATUS_TIMEOUT;
++    }
++
++    if ((ret = get_wfusync_wait_slot()))
++        return ret == STATUS_NOT_IMPLEMENTED ? STATUS_NOT_IMPLEMENTED : ret;
++    if (timeout) get_relative_timeout_abs( timeout, &deadline );
++
++    for (;;)
++    {
++        struct timespec now, wait_timeout;
++        struct timespec *wait_timeout_ptr = NULL;
++        unsigned long long ns;
++
++        if ((ret = register_wfusync_wait( shm_idxs, count )))
++            return ret == STATUS_NOT_IMPLEMENTED ? STATUS_NOT_IMPLEMENTED : ret;
++
++        ret = consume_waitany_states( handles, states, generations, types, count );
++        if (ret != STATUS_TIMEOUT)
++        {
++            unregister_wfusync_wait();
++            if (ret == STATUS_NOT_IMPLEMENTED)
++                return STATUS_NOT_IMPLEMENTED;
++            return ret;
++        }
++
++        if (timeout)
++        {
++            get_now_abs( &now );
++            ns = timespec_diff_ns( &deadline, &now );
++            if (!ns)
++            {
++                unregister_wfusync_wait();
++                return STATUS_TIMEOUT;
++            }
++            ns_to_timespec( ns, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        else
++        {
++            ns_to_timespec( WFUSYNC_BLOCKING_FALLBACK_NS, &wait_timeout );
++            wait_timeout_ptr = &wait_timeout;
++        }
++        ret = wfusync_wait_address( &wfusync_wait_slot->low, 1, wait_timeout_ptr );
++        unregister_wfusync_wait();
++
++        if (ret == STATUS_TIMEOUT)
++        {
++            if (!timeout) return STATUS_NOT_IMPLEMENTED;
++            return STATUS_TIMEOUT;
++        }
++        if (ret == STATUS_NOT_IMPLEMENTED)
++            return STATUS_NOT_IMPLEMENTED;
++        if (ret != STATUS_SUCCESS) return ret;
++
++        ret = consume_waitany_states( handles, states, generations, types, count );
++        if (ret != STATUS_TIMEOUT)
++        {
++            if (ret == STATUS_NOT_IMPLEMENTED)
++                return STATUS_NOT_IMPLEMENTED;
++            return ret;
++        }
++    }
++}
+diff --git a/dlls/ntdll/unix/wfusync.h b/dlls/ntdll/unix/wfusync.h
+new file mode 100644
+index 0000000..7870da5
+--- /dev/null
++++ b/dlls/ntdll/unix/wfusync.h
+@@ -0,0 +1,51 @@
++/*
++ * WineForge userspace synchronization client state
++ *
++ * Copyright (C) 2026 Radim Vesely
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef __WINE_NTDLL_UNIX_WFUSYNC_H
++#define __WINE_NTDLL_UNIX_WFUSYNC_H
++
++#include "ntstatus.h"
++#include "windef.h"
++
++struct wfusync_fast_state
++{
++    int type;
++    unsigned int access;
++    unsigned int shm_idx;
++    void *ptr;
++    unsigned int generation;
++};
++
++extern int do_wfusync(void);
++extern void wfusync_mark_local_event( HANDLE handle );
++extern void wfusync_mark_local_mutex( HANDLE handle );
++extern void wfusync_mark_local_semaphore( HANDLE handle );
++extern BOOL wfusync_handle_is_local_event( HANDLE handle );
++extern BOOL wfusync_handle_is_local_mutex( HANDLE handle );
++extern BOOL wfusync_handle_is_local_semaphore( HANDLE handle );
++extern BOOL wfusync_get_cached_state( HANDLE handle, struct wfusync_fast_state *state );
++extern void wfusync_cache_inproc_sync( HANDLE handle, int type, unsigned int access, unsigned int shm_idx, int fd );
++extern void wfusync_drop_handle( HANDLE handle );
++extern void wfusync_note_fallback( HANDLE handle, NTSTATUS status );
++extern NTSTATUS wfusync_set_event( HANDLE handle, LONG *prev_state );
++extern NTSTATUS wfusync_reset_event( HANDLE handle, LONG *prev_state );
++extern NTSTATUS wfusync_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info );
++extern NTSTATUS wfusync_wait_event( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout );
++extern NTSTATUS wfusync_release_mutex( HANDLE handle, LONG *prev_count );
++extern NTSTATUS wfusync_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *info );
++extern NTSTATUS wfusync_wait_mutex( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout );
++extern NTSTATUS wfusync_wait_multiple( DWORD count, const HANDLE *handles, WAIT_TYPE type,
++                                       BOOLEAN alertable, const LARGE_INTEGER *timeout );
++extern NTSTATUS wfusync_release_semaphore( HANDLE handle, ULONG count, ULONG *previous );
++extern NTSTATUS wfusync_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATION *info );
++extern NTSTATUS wfusync_wait_semaphore( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout );
++
++#endif
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index c74b015..728c97c 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6052,9 +6052,71 @@ struct get_inproc_sync_fd_reply
+     struct reply_header __header;
+     int           type;
+     unsigned int access;
++    unsigned int shm_idx;
++    char __pad_20[4];
++};
++
++
++struct get_wfusync_wait_slot_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct get_wfusync_wait_slot_reply
++{
++    struct reply_header __header;
++    unsigned int shm_idx;
++    char __pad_12[4];
++};
++
++
++struct register_wfusync_wait_request
++{
++    struct request_header __header;
++    unsigned int slot_idx;
++    /* VARARG(shm_idxs,uints); */
++};
++struct register_wfusync_wait_reply
++{
++    struct reply_header __header;
++};
++
++
++struct unregister_wfusync_wait_request
++{
++    struct request_header __header;
++    unsigned int slot_idx;
++};
++struct unregister_wfusync_wait_reply
++{
++    struct reply_header __header;
++};
++
++
++struct wake_wfusync_waiters_request
++{
++    struct request_header __header;
++    unsigned int shm_idx;
++};
++struct wake_wfusync_waiters_reply
++{
++    struct reply_header __header;
+ };
+ 
+ 
++struct try_wait_all_wfusync_request
++{
++    struct request_header __header;
++    thread_id_t  tid;
++    unsigned int slot_idx;
++    /* VARARG(entries,uints); */
++    char __pad_20[4];
++};
++struct try_wait_all_wfusync_reply
++{
++    struct reply_header __header;
++};
++
+ 
+ struct get_inproc_alert_fd_request
+ {
+@@ -6512,6 +6574,11 @@ enum request
+     REQ_get_next_thread,
+     REQ_set_keyboard_repeat,
+     REQ_get_inproc_sync_fd,
++    REQ_get_wfusync_wait_slot,
++    REQ_register_wfusync_wait,
++    REQ_unregister_wfusync_wait,
++    REQ_wake_wfusync_waiters,
++    REQ_try_wait_all_wfusync,
+     REQ_get_inproc_alert_fd,
+     REQ_d3dkmt_object_create,
+     REQ_d3dkmt_object_update,
+@@ -6826,6 +6893,11 @@ union generic_request
+     struct get_next_thread_request get_next_thread_request;
+     struct set_keyboard_repeat_request set_keyboard_repeat_request;
+     struct get_inproc_sync_fd_request get_inproc_sync_fd_request;
++    struct get_wfusync_wait_slot_request get_wfusync_wait_slot_request;
++    struct register_wfusync_wait_request register_wfusync_wait_request;
++    struct unregister_wfusync_wait_request unregister_wfusync_wait_request;
++    struct wake_wfusync_waiters_request wake_wfusync_waiters_request;
++    struct try_wait_all_wfusync_request try_wait_all_wfusync_request;
+     struct get_inproc_alert_fd_request get_inproc_alert_fd_request;
+     struct d3dkmt_object_create_request d3dkmt_object_create_request;
+     struct d3dkmt_object_update_request d3dkmt_object_update_request;
+@@ -7138,6 +7210,11 @@ union generic_reply
+     struct get_next_thread_reply get_next_thread_reply;
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+     struct get_inproc_sync_fd_reply get_inproc_sync_fd_reply;
++    struct get_wfusync_wait_slot_reply get_wfusync_wait_slot_reply;
++    struct register_wfusync_wait_reply register_wfusync_wait_reply;
++    struct unregister_wfusync_wait_reply unregister_wfusync_wait_reply;
++    struct wake_wfusync_waiters_reply wake_wfusync_waiters_reply;
++    struct try_wait_all_wfusync_reply try_wait_all_wfusync_reply;
+     struct get_inproc_alert_fd_reply get_inproc_alert_fd_reply;
+     struct d3dkmt_object_create_reply d3dkmt_object_create_reply;
+     struct d3dkmt_object_update_reply d3dkmt_object_update_reply;
+@@ -7149,6 +7226,6 @@ union generic_reply
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 952
++#define SERVER_PROTOCOL_VERSION 958
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/Makefile.in b/server/Makefile.in
+index 84a6bd7..e7f1778 100644
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -45,6 +45,7 @@ SOURCES = \
+ 	unicode.c \
+ 	user.c \
+ 	window.c \
++	wfusync.c \
+ 	wineserver.de.UTF-8.man.in \
+ 	wineserver.fr.UTF-8.man.in \
+ 	wineserver.man.in \
+diff --git a/server/event.c b/server/event.c
+index cbc7af1..d0d805a 100644
+--- a/server/event.c
++++ b/server/event.c
+@@ -34,6 +34,7 @@
+ #include "thread.h"
+ #include "request.h"
+ #include "security.h"
++#include "wfusync.h"
+ 
+ static const WCHAR event_name[] = {'E','v','e','n','t'};
+ 
+@@ -54,20 +55,24 @@ struct event_sync
+     struct object  obj;             /* object header */
+     unsigned int   manual : 1;      /* is it a manual reset event? */
+     unsigned int   signaled : 1;    /* event has been signaled */
++    struct wfusync *wfusync;        /* optional shared fast-path state */
+ };
+ 
+ static void event_sync_dump( struct object *obj, int verbose );
++static int event_sync_add_queue( struct object *obj, struct wait_queue_entry *entry );
++static void event_sync_remove_queue( struct object *obj, struct wait_queue_entry *entry );
+ static int event_sync_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static void event_sync_satisfied( struct object *obj, struct wait_queue_entry *entry );
+ static int event_sync_signal( struct object *obj, unsigned int access, int signal );
++static void event_sync_destroy( struct object *obj );
+ 
+ static const struct object_ops event_sync_ops =
+ {
+     sizeof(struct event_sync), /* size */
+     &no_type,                  /* type */
+     event_sync_dump,           /* dump */
+-    add_queue,                 /* add_queue */
+-    remove_queue,              /* remove_queue */
++    event_sync_add_queue,      /* add_queue */
++    event_sync_remove_queue,   /* remove_queue */
+     event_sync_signaled,       /* signaled */
+     event_sync_satisfied,      /* satisfied */
+     event_sync_signal,         /* signal */
+@@ -83,18 +88,21 @@ static const struct object_ops event_sync_ops =
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+     no_close_handle,           /* close_handle */
+-    no_destroy                 /* destroy */
++    event_sync_destroy         /* destroy */
+ };
+ 
+-static struct object *create_event_sync( int manual, int signaled )
++static struct object *create_event_sync( int manual, int signaled, int inproc )
+ {
+     struct event_sync *event;
+ 
+-    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_event_sync( manual, signaled );
+-
+     if (!(event = alloc_object( &event_sync_ops ))) return NULL;
+     event->manual   = manual;
+     event->signaled = signaled;
++    event->wfusync  = NULL;
++
++    if (inproc && do_wfusync() &&
++        !(event->wfusync = create_wfusync( signaled, manual, INPROC_SYNC_EVENT )))
++        clear_error();
+ 
+     return &event->obj;
+ }
+@@ -106,13 +114,13 @@ struct event_sync *create_server_internal_sync( int manual, int signaled )
+     if (!(event = alloc_object( &event_sync_ops ))) return NULL;
+     event->manual   = manual;
+     event->signaled = signaled;
++    event->wfusync  = NULL;
+ 
+     return event;
+ }
+ 
+ struct object *create_internal_sync( int manual, int signaled )
+ {
+-    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_internal_sync( manual, signaled );
+     return (struct object *)create_server_internal_sync( manual, signaled );
+ }
+ 
+@@ -128,14 +136,34 @@ static int event_sync_signaled( struct object *obj, struct wait_queue_entry *ent
+ {
+     struct event_sync *event = (struct event_sync *)obj;
+     assert( obj->ops == &event_sync_ops );
++    if (event->wfusync) return wfusync_event_signaled( event->wfusync );
+     return event->signaled;
+ }
+ 
++static int event_sync_add_queue( struct object *obj, struct wait_queue_entry *entry )
++{
++    struct event_sync *event = (struct event_sync *)obj;
++
++    assert( obj->ops == &event_sync_ops );
++    if (event->wfusync) wfusync_add_server_waiter( event->wfusync );
++    return add_queue( obj, entry );
++}
++
++static void event_sync_remove_queue( struct object *obj, struct wait_queue_entry *entry )
++{
++    struct event_sync *event = (struct event_sync *)obj;
++
++    assert( obj->ops == &event_sync_ops );
++    if (event->wfusync) wfusync_remove_server_waiter( event->wfusync );
++    remove_queue( obj, entry );
++}
++
+ static void event_sync_satisfied( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct event_sync *event = (struct event_sync *)obj;
+     assert( obj->ops == &event_sync_ops );
+     /* Reset if it's an auto-reset event */
++    if (event->wfusync) wfusync_event_satisfied( event->wfusync );
+     if (!event->manual) event->signaled = 0;
+ }
+ 
+@@ -145,10 +173,25 @@ static int event_sync_signal( struct object *obj, unsigned int access, int signa
+     assert( obj->ops == &event_sync_ops );
+ 
+     /* wake up all waiters if manual reset, a single one otherwise */
+-    if ((event->signaled = !!signal)) wake_up( &event->obj, !event->manual );
++    event->signaled = !!signal;
++    if (event->wfusync)
++    {
++        if (signal) wfusync_set_event( event->wfusync );
++        else wfusync_reset_event( event->wfusync );
++        wake_up( &event->obj, !event->manual );
++        return 1;
++    }
++    if (event->signaled) wake_up( &event->obj, !event->manual );
+     return 1;
+ }
+ 
++static void event_sync_destroy( struct object *obj )
++{
++    struct event_sync *event = (struct event_sync *)obj;
++    assert( obj->ops == &event_sync_ops );
++    if (event->wfusync) wfusync_destroy( event->wfusync );
++}
++
+ struct event
+ {
+     struct object      obj;             /* object header */
+@@ -250,7 +293,7 @@ struct event *create_event( struct object *root, const struct unicode_str *name,
+             event->sync = NULL;
+             list_init( &event->kernel_object );
+ 
+-            if (!(event->sync = create_event_sync( manual_reset, initial_state )))
++            if (!(event->sync = create_event_sync( manual_reset, initial_state, 1 )))
+             {
+                 release_object( event );
+                 return NULL;
+@@ -294,7 +337,6 @@ static int event_signal( struct object *obj, unsigned int access, int signal )
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+ 
+-    assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
+     assert( signal == -1 ); /* always called from signal_object */
+ 
+     if (!(access & EVENT_MODIFY_STATE))
+@@ -303,7 +345,11 @@ static int event_signal( struct object *obj, unsigned int access, int signal )
+         return 0;
+     }
+ 
+-    return event_sync_signal( event->sync, 0, 1 );
++    if (event->sync->ops == &event_sync_ops) return event_sync_signal( event->sync, 0, 1 );
++    if (set_inproc_event_state( event->sync, 1 )) return 1;
++
++    assert( 0 );
++    return 0;
+ }
+ 
+ static struct list *event_get_kernel_obj_list( struct object *obj )
+@@ -320,6 +366,21 @@ static void event_destroy( struct object *obj )
+     if (event->sync) release_object( event->sync );
+ }
+ 
++int get_event_wfusync_idx( struct object *obj, int *type )
++{
++    struct event_sync *sync;
++    struct event *event;
++
++    if (!do_wfusync() || !obj || obj->ops != &event_ops) return -1;
++    event = (struct event *)obj;
++    if (!event->sync || event->sync->ops != &event_sync_ops) return -1;
++    sync = (struct event_sync *)event->sync;
++    if (!sync->wfusync) return -1;
++    wfusync_grab_object( sync->wfusync );
++    *type = INPROC_SYNC_EVENT;
++    return wfusync_get_index( sync->wfusync );
++}
++
+ struct keyed_event *create_keyed_event( struct object *root, const struct unicode_str *name,
+                                         unsigned int attr, const struct security_descriptor *sd )
+ {
+@@ -412,23 +473,45 @@ DECL_HANDLER(event_op)
+ {
+     struct event_sync *sync;
+     struct event *event;
++    int signaled;
+ 
+     if (!(event = get_event_obj( current->process, req->handle, EVENT_MODIFY_STATE ))) return;
+-    assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
+-    sync = (struct event_sync *)event->sync;
+ 
+-    reply->state = sync->signaled;
++    if (event->sync->ops == &event_sync_ops)
++    {
++        sync = (struct event_sync *)event->sync;
++        if (!sync->wfusync || !wfusync_get_event_state( sync->wfusync, NULL, &signaled ))
++            signaled = sync->signaled;
++    }
++    else if (!get_inproc_event_state( event->sync, NULL, &signaled ))
++    {
++        assert( 0 );
++        release_object( event );
++        return;
++    }
++
++    reply->state = signaled;
+     switch(req->op)
+     {
+     case PULSE_EVENT:
+-        set_event( event );
+-        reset_event( event );
++        if (event->sync->ops == &event_sync_ops)
++        {
++            set_event( event );
++            reset_event( event );
++        }
++        else
++        {
++            set_inproc_event_state( event->sync, 1 );
++            set_inproc_event_state( event->sync, 0 );
++        }
+         break;
+     case SET_EVENT:
+-        set_event( event );
++        if (event->sync->ops == &event_sync_ops) set_event( event );
++        else set_inproc_event_state( event->sync, 1 );
+         break;
+     case RESET_EVENT:
+-        reset_event( event );
++        if (event->sync->ops == &event_sync_ops) reset_event( event );
++        else set_inproc_event_state( event->sync, 0 );
+         break;
+     default:
+         set_error( STATUS_INVALID_PARAMETER );
+@@ -442,13 +525,28 @@ DECL_HANDLER(query_event)
+ {
+     struct event_sync *sync;
+     struct event *event;
++    int manual, signaled;
+ 
+     if (!(event = get_event_obj( current->process, req->handle, EVENT_QUERY_STATE ))) return;
+-    assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
+-    sync = (struct event_sync *)event->sync;
+ 
+-    reply->manual_reset = sync->manual;
+-    reply->state = sync->signaled;
++    if (event->sync->ops == &event_sync_ops)
++    {
++        sync = (struct event_sync *)event->sync;
++        if (!sync->wfusync || !wfusync_get_event_state( sync->wfusync, &manual, &signaled ))
++        {
++            manual = sync->manual;
++            signaled = sync->signaled;
++        }
++    }
++    else if (!get_inproc_event_state( event->sync, &manual, &signaled ))
++    {
++        assert( 0 );
++        release_object( event );
++        return;
++    }
++
++    reply->manual_reset = manual;
++    reply->state = signaled;
+ 
+     release_object( event );
+ }
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index ef68ee0..0073062 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -32,6 +32,7 @@
+ #include "request.h"
+ #include "thread.h"
+ #include "user.h"
++#include "wfusync.h"
+ 
+ #ifdef HAVE_LINUX_NTSYNC_H
+ # include <linux/ntsync.h>
+@@ -193,6 +194,16 @@ void reset_inproc_sync( struct inproc_sync *sync )
+     ioctl( sync->fd, NTSYNC_IOC_EVENT_RESET, &count );
+ }
+ 
++int get_inproc_event_state( struct object *obj, int *manual, int *signaled )
++{
++    return 0;
++}
++
++int set_inproc_event_state( struct object *obj, int signaled )
++{
++    return 0;
++}
++
+ static int inproc_sync_signal( struct object *obj, unsigned int access, int signal )
+ {
+     struct inproc_sync *sync = (struct inproc_sync *)obj;
+@@ -239,6 +250,192 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
+     return fd;
+ }
+ 
++#elif defined(__APPLE__)
++
++struct inproc_sync
++{
++    struct object          obj;  /* object header */
++    enum inproc_sync_type  type;
++    struct wfusync        *wfusync;
++    struct list            entry;
++};
++
++static struct list inproc_mutexes = LIST_INIT( inproc_mutexes );
++
++static void inproc_sync_dump( struct object *obj, int verbose );
++static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
++static void inproc_sync_destroy( struct object *obj );
++
++static const struct object_ops inproc_sync_ops =
++{
++    sizeof(struct inproc_sync), /* size */
++    &no_type,                   /* type */
++    inproc_sync_dump,           /* dump */
++    no_add_queue,               /* add_queue */
++    NULL,                       /* remove_queue */
++    NULL,                       /* signaled */
++    NULL,                       /* satisfied */
++    inproc_sync_signal,         /* signal */
++    no_get_fd,                  /* get_fd */
++    default_get_sync,           /* get_sync */
++    default_map_access,         /* map_access */
++    default_get_sd,             /* get_sd */
++    default_set_sd,             /* set_sd */
++    default_get_full_name,      /* get_full_name */
++    no_lookup_name,             /* lookup_name */
++    directory_link_name,        /* link_name */
++    default_unlink_name,        /* unlink_name */
++    no_open_file,               /* open_file */
++    no_kernel_obj_list,         /* get_kernel_obj_list */
++    no_close_handle,            /* close_handle */
++    inproc_sync_destroy,        /* destroy */
++};
++
++int get_inproc_device_fd(void)
++{
++    return -1;
++}
++
++int get_inproc_sync_fd( struct inproc_sync *sync )
++{
++    if (!sync) return -1;
++    return wfusync_get_index( sync->wfusync );
++}
++
++static struct inproc_sync *create_wfusync_inproc_sync( enum inproc_sync_type type, int low, int high )
++{
++    struct inproc_sync *sync;
++
++    if (!(sync = alloc_object( &inproc_sync_ops ))) return NULL;
++    sync->type = type;
++    sync->wfusync = create_wfusync( low, high, type );
++    list_init( &sync->entry );
++
++    if (!sync->wfusync)
++    {
++        set_error( STATUS_NO_MEMORY );
++        release_object( sync );
++        return NULL;
++    }
++    return sync;
++}
++
++struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
++{
++    return create_wfusync_inproc_sync( INPROC_SYNC_INTERNAL, signaled, manual );
++}
++
++struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
++{
++    return create_wfusync_inproc_sync( INPROC_SYNC_EVENT, signaled, manual );
++}
++
++struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count )
++{
++    struct inproc_sync *mutex = create_wfusync_inproc_sync( INPROC_SYNC_MUTEX, owner, count );
++
++    if (mutex) list_add_tail( &inproc_mutexes, &mutex->entry );
++    return mutex;
++}
++
++struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max )
++{
++    return create_wfusync_inproc_sync( INPROC_SYNC_SEMAPHORE, initial, max );
++}
++
++static void inproc_sync_dump( struct object *obj, int verbose )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++    fprintf( stderr, "WFUSync inproc type=%d, shm_idx=%u\n",
++             sync->type, wfusync_get_index( sync->wfusync ) );
++}
++
++void signal_inproc_sync( struct inproc_sync *sync )
++{
++    if (debug_level) fprintf( stderr, "set_wfusync_event %u\n", wfusync_get_index( sync->wfusync ) );
++    wfusync_set_event( sync->wfusync );
++}
++
++void reset_inproc_sync( struct inproc_sync *sync )
++{
++    if (debug_level) fprintf( stderr, "reset_wfusync_event %u\n", wfusync_get_index( sync->wfusync ) );
++    wfusync_reset_event( sync->wfusync );
++}
++
++int get_inproc_event_state( struct object *obj, int *manual, int *signaled )
++{
++    struct inproc_sync *sync;
++
++    if (!obj || obj->ops != &inproc_sync_ops) return 0;
++    sync = (struct inproc_sync *)obj;
++    return wfusync_get_event_state( sync->wfusync, manual, signaled );
++}
++
++int set_inproc_event_state( struct object *obj, int signaled )
++{
++    struct inproc_sync *sync;
++
++    if (!obj || obj->ops != &inproc_sync_ops) return 0;
++    sync = (struct inproc_sync *)obj;
++    if (!wfusync_get_event_state( sync->wfusync, NULL, NULL )) return 0;
++    if (signaled) wfusync_set_event( sync->wfusync );
++    else wfusync_reset_event( sync->wfusync );
++    return 1;
++}
++
++static int inproc_sync_signal( struct object *obj, unsigned int access, int signal )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++
++    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT );
++    assert( signal == 0 || signal == 1 );
++
++    if (signal) signal_inproc_sync( sync );
++    else reset_inproc_sync( sync );
++    return 1;
++}
++
++static void inproc_sync_destroy( struct object *obj )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++    if (sync->type == INPROC_SYNC_MUTEX) list_remove( &sync->entry );
++    wfusync_destroy( sync->wfusync );
++}
++
++void abandon_inproc_mutexes( thread_id_t tid )
++{
++    struct inproc_sync *mutex;
++
++    LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
++        wfusync_abandon_mutex( mutex->wfusync, tid );
++}
++
++static int get_obj_inproc_sync( struct object *obj, int *type )
++{
++    struct object *sync;
++    int shm_idx = -1;
++
++    if (!do_wfusync()) return -1;
++    if ((shm_idx = get_event_wfusync_idx( obj, type )) >= 0) return shm_idx;
++    if ((shm_idx = get_semaphore_wfusync_idx( obj, type )) >= 0) return shm_idx;
++    if ((shm_idx = get_mutex_wfusync_idx( obj, type )) >= 0) return shm_idx;
++
++    if (!(sync = get_obj_sync( obj ))) return -1;
++    if (sync->ops == &inproc_sync_ops)
++    {
++        struct inproc_sync *inproc = (struct inproc_sync *)sync;
++        wfusync_grab_object( inproc->wfusync );
++        *type = inproc->type;
++        shm_idx = wfusync_get_index( inproc->wfusync );
++    }
++
++    release_object( sync );
++    return shm_idx;
++}
++
+ #else /* NTSYNC_IOC_EVENT_READ */
+ 
+ int get_inproc_device_fd(void)
+@@ -279,6 +476,16 @@ void reset_inproc_sync( struct inproc_sync *sync )
+ {
+ }
+ 
++int get_inproc_event_state( struct object *obj, int *manual, int *signaled )
++{
++    return 0;
++}
++
++int set_inproc_event_state( struct object *obj, int signaled )
++{
++    return 0;
++}
++
+ void abandon_inproc_mutexes( thread_id_t tid )
+ {
+ }
+@@ -298,9 +505,21 @@ DECL_HANDLER(get_inproc_sync_fd)
+     if (!(obj = get_handle_obj( current->process, req->handle, 0, NULL ))) return;
+ 
+     reply->access = get_handle_access( current->process, req->handle );
++    reply->shm_idx = 0;
+ 
+     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+-    else send_client_fd( current->process, fd, req->handle );
++    else
++    {
++#if defined(__APPLE__)
++        if (do_wfusync())
++        {
++            reply->shm_idx = fd;
++            send_client_fd( current->process, wfusync_get_shared_fd(), req->handle );
++        }
++        else
++#endif
++        send_client_fd( current->process, fd, req->handle );
++    }
+ 
+     release_object( obj );
+ }
+diff --git a/server/mutex.c b/server/mutex.c
+index 5beffed..bbdf49d 100644
+--- a/server/mutex.c
++++ b/server/mutex.c
+@@ -34,6 +34,7 @@
+ #include "thread.h"
+ #include "request.h"
+ #include "security.h"
++#include "wfusync.h"
+ 
+ static const WCHAR mutex_name[] = {'M','u','t','a','n','t'};
+ 
+@@ -56,20 +57,26 @@ struct mutex_sync
+     unsigned int        count;              /* recursion count */
+     int                 abandoned;          /* has it been abandoned? */
+     struct list         entry;              /* entry in owner thread mutex list */
++    struct list         wfusync_entry;      /* entry in WFUSync mutex list */
++    struct wfusync     *wfusync;            /* optional shared fast-path state */
+ };
+ 
+ static void mutex_sync_dump( struct object *obj, int verbose );
++static int mutex_sync_add_queue( struct object *obj, struct wait_queue_entry *entry );
++static void mutex_sync_remove_queue( struct object *obj, struct wait_queue_entry *entry );
+ static int mutex_sync_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static void mutex_sync_satisfied( struct object *obj, struct wait_queue_entry *entry );
+ static void mutex_sync_destroy( struct object *obj );
+ 
++static struct list wfusync_mutexes = LIST_INIT( wfusync_mutexes );
++
+ static const struct object_ops mutex_sync_ops =
+ {
+     sizeof(struct mutex_sync), /* size */
+     &no_type,                  /* type */
+     mutex_sync_dump,           /* dump */
+-    add_queue,                 /* add_queue */
+-    remove_queue,              /* remove_queue */
++    mutex_sync_add_queue,      /* add_queue */
++    mutex_sync_remove_queue,   /* remove_queue */
+     mutex_sync_signaled,       /* signaled */
+     mutex_sync_satisfied,      /* satisfied */
+     no_signal,                 /* signal */
+@@ -128,10 +135,31 @@ static void mutex_sync_dump( struct object *obj, int verbose )
+     fprintf( stderr, "Mutex count=%u owner=%p\n", mutex->count, mutex->owner );
+ }
+ 
++static int mutex_sync_add_queue( struct object *obj, struct wait_queue_entry *entry )
++{
++    struct mutex_sync *mutex = (struct mutex_sync *)obj;
++    assert( obj->ops == &mutex_sync_ops );
++    if (mutex->wfusync) wfusync_add_server_waiter( mutex->wfusync );
++    return add_queue( obj, entry );
++}
++
++static void mutex_sync_remove_queue( struct object *obj, struct wait_queue_entry *entry )
++{
++    struct mutex_sync *mutex = (struct mutex_sync *)obj;
++    assert( obj->ops == &mutex_sync_ops );
++    if (mutex->wfusync) wfusync_remove_server_waiter( mutex->wfusync );
++    remove_queue( obj, entry );
++}
++
+ static void mutex_sync_destroy( struct object *obj )
+ {
+     struct mutex_sync *mutex = (struct mutex_sync *)obj;
+     assert( obj->ops == &mutex_sync_ops );
++    if (mutex->wfusync)
++    {
++        list_remove( &mutex->wfusync_entry );
++        wfusync_destroy( mutex->wfusync );
++    }
+     assert( !mutex->count );
+ }
+ 
+@@ -139,29 +167,50 @@ static int mutex_sync_signaled( struct object *obj, struct wait_queue_entry *ent
+ {
+     struct mutex_sync *mutex = (struct mutex_sync *)obj;
+     assert( obj->ops == &mutex_sync_ops );
++    if (mutex->wfusync) return wfusync_mutex_signaled( mutex->wfusync, get_wait_queue_thread( entry )->id );
+     return (!mutex->count || (mutex->owner == get_wait_queue_thread( entry )));
+ }
+ 
+ static void mutex_sync_satisfied( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct mutex_sync *mutex = (struct mutex_sync *)obj;
++    int abandoned;
++
+     assert( obj->ops == &mutex_sync_ops );
+ 
++    if (mutex->wfusync)
++    {
++        if (wfusync_mutex_satisfied( mutex->wfusync, get_wait_queue_thread( entry )->id, &abandoned ) &&
++            abandoned)
++            make_wait_abandoned( entry );
++        return;
++    }
++
+     do_grab( mutex, get_wait_queue_thread( entry ));
+     if (mutex->abandoned) make_wait_abandoned( entry );
+     mutex->abandoned = 0;
+ }
+ 
+-static struct object *create_mutex_sync( int owned )
++static struct object *create_mutex_sync( int owned, int inproc )
+ {
+     struct mutex_sync *mutex;
+ 
+-    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_mutex_sync( owned ? current->id : 0, owned ? 1 : 0 );
+-
+     if (!(mutex = alloc_object( &mutex_sync_ops ))) return NULL;
+     mutex->count = 0;
+     mutex->owner = NULL;
+     mutex->abandoned = 0;
++    list_init( &mutex->wfusync_entry );
++    mutex->wfusync = NULL;
++    if (inproc && do_wfusync())
++    {
++        mutex->wfusync = create_wfusync( owned ? current->id : 0, owned ? 1 : 0, INPROC_SYNC_MUTEX );
++        if (mutex->wfusync)
++        {
++            list_add_tail( &wfusync_mutexes, &mutex->wfusync_entry );
++            return &mutex->obj;
++        }
++        clear_error();
++    }
+     if (owned) do_grab( mutex, current );
+ 
+     return &mutex->obj;
+@@ -215,7 +264,7 @@ static struct mutex *create_mutex( struct object *root, const struct unicode_str
+             /* initialize it if it didn't already exist */
+             mutex->sync = NULL;
+ 
+-            if (!(mutex->sync = create_mutex_sync( owned )))
++            if (!(mutex->sync = create_mutex_sync( owned, 1 )))
+             {
+                 release_object( mutex );
+                 return NULL;
+@@ -237,6 +286,17 @@ void abandon_mutexes( struct thread *thread )
+         do_release( mutex, thread, mutex->count );
+     }
+ 
++    LIST_FOR_EACH( ptr, &wfusync_mutexes )
++    {
++        struct mutex_sync *mutex = LIST_ENTRY( ptr, struct mutex_sync, wfusync_entry );
++
++        if (wfusync_abandon_mutex( mutex->wfusync, thread->id ))
++        {
++            wake_up( &mutex->obj, 0 );
++            wfusync_wake_waiters( wfusync_get_index( mutex->wfusync ) );
++        }
++    }
++
+     abandon_inproc_mutexes( thread->id );
+ }
+ 
+@@ -267,6 +327,15 @@ static int mutex_signal( struct object *obj, unsigned int access, int signal )
+         set_error( STATUS_ACCESS_DENIED );
+         return 0;
+     }
++    if (((struct mutex_sync *)mutex->sync)->wfusync)
++    {
++        unsigned int prev;
++
++        if (!wfusync_release_mutex( ((struct mutex_sync *)mutex->sync)->wfusync, current->id, &prev ))
++            return 0;
++        if (prev == 1) wake_up( mutex->sync, 0 );
++        return 1;
++    }
+     return do_release( (struct mutex_sync *)mutex->sync, current, 1 );
+ }
+ 
+@@ -277,6 +346,21 @@ static void mutex_destroy( struct object *obj )
+     if (mutex->sync) release_object( mutex->sync );
+ }
+ 
++int get_mutex_wfusync_idx( struct object *obj, int *type )
++{
++    struct mutex_sync *sync;
++    struct mutex *mutex;
++
++    if (!do_wfusync() || !obj || obj->ops != &mutex_ops) return -1;
++    mutex = (struct mutex *)obj;
++    if (!mutex->sync || mutex->sync->ops != &mutex_sync_ops) return -1;
++    sync = (struct mutex_sync *)mutex->sync;
++    if (!sync->wfusync) return -1;
++    wfusync_grab_object( sync->wfusync );
++    *type = INPROC_SYNC_MUTEX;
++    return wfusync_get_index( sync->wfusync );
++}
++
+ /* create a mutex */
+ DECL_HANDLER(create_mutex)
+ {
+@@ -321,8 +405,20 @@ DECL_HANDLER(release_mutex)
+         struct mutex_sync *sync = (struct mutex_sync *)mutex->sync;
+         assert( mutex->sync->ops == &mutex_sync_ops ); /* never called with inproc syncs */
+ 
+-        reply->prev_count = sync->count;
+-        do_release( sync, current, 1 );
++        if (sync->wfusync)
++        {
++            if (wfusync_release_mutex( sync->wfusync, current->id, &reply->prev_count ) &&
++                reply->prev_count == 1)
++            {
++                wake_up( mutex->sync, 0 );
++                wfusync_wake_waiters( wfusync_get_index( sync->wfusync ) );
++            }
++        }
++        else
++        {
++            reply->prev_count = sync->count;
++            do_release( sync, current, 1 );
++        }
+         release_object( mutex );
+     }
+ }
+@@ -338,9 +434,15 @@ DECL_HANDLER(query_mutex)
+         struct mutex_sync *sync = (struct mutex_sync *)mutex->sync;
+         assert( mutex->sync->ops == &mutex_sync_ops ); /* never called with inproc syncs */
+ 
+-        reply->count = sync->count;
+-        reply->owned = (sync->owner == current);
+-        reply->abandoned = sync->abandoned;
++        if (sync->wfusync)
++            wfusync_get_mutex_state( sync->wfusync, current->id, &reply->count,
++                                     &reply->owned, &reply->abandoned );
++        else
++        {
++            reply->count = sync->count;
++            reply->owned = (sync->owner == current);
++            reply->abandoned = sync->abandoned;
++        }
+ 
+         release_object( mutex );
+     }
+diff --git a/server/object.h b/server/object.h
+index 171ca2f..036dfe1 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -255,6 +255,11 @@ extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned
+ extern void abandon_inproc_mutexes( thread_id_t owner );
+ extern void signal_inproc_sync( struct inproc_sync *sync );
+ extern void reset_inproc_sync( struct inproc_sync *sync );
++extern int get_inproc_event_state( struct object *obj, int *manual, int *signaled );
++extern int set_inproc_event_state( struct object *obj, int signaled );
++extern int get_event_wfusync_idx( struct object *obj, int *type );
++extern int get_semaphore_wfusync_idx( struct object *obj, int *type );
++extern int get_mutex_wfusync_idx( struct object *obj, int *type );
+ 
+ /* serial functions */
+ 
+diff --git a/server/protocol.def b/server/protocol.def
+index 6c2ffc8..ae38a35 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4213,8 +4213,37 @@ enum inproc_sync_type
+ @REPLY
+     int           type;         /* inproc sync type */
+     unsigned int access;        /* handle access rights */
++    unsigned int shm_idx;       /* optional for index-based sync implementations */
+ @END
+ 
++/* Get a per-thread WFUSync wait slot */
++@REQ(get_wfusync_wait_slot)
++@REPLY
++    unsigned int shm_idx;       /* shared-memory index of the wait slot */
++@END
++
++/* Register a WFUSync WaitAny wait */
++@REQ(register_wfusync_wait)
++    unsigned int slot_idx;      /* wait slot shared-memory index */
++    VARARG(shm_idxs,uints);     /* object shared-memory indexes */
++@END
++
++/* Unregister a WFUSync WaitAny wait */
++@REQ(unregister_wfusync_wait)
++    unsigned int slot_idx;      /* wait slot shared-memory index */
++@END
++
++/* Wake WFUSync WaitAny wait slots for a signaled object */
++@REQ(wake_wfusync_waiters)
++    unsigned int shm_idx;       /* object shared-memory index */
++@END
++
++/* Try to satisfy WFUSync WaitAll, optionally registering a wait slot */
++@REQ(try_wait_all_wfusync)
++    thread_id_t  tid;           /* waiting thread id */
++    unsigned int slot_idx;      /* wait slot index, or zero for a nonblocking try */
++    VARARG(entries,uints);      /* shm_idx, generation, type triples */
++@END
+ 
+ /* Get the in-process synchronization fd for the current thread user APC alerts */
+ @REQ(get_inproc_alert_fd)
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 03cf907..713aee8 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -305,6 +305,11 @@ DECL_HANDLER(get_next_process);
+ DECL_HANDLER(get_next_thread);
+ DECL_HANDLER(set_keyboard_repeat);
+ DECL_HANDLER(get_inproc_sync_fd);
++DECL_HANDLER(get_wfusync_wait_slot);
++DECL_HANDLER(register_wfusync_wait);
++DECL_HANDLER(unregister_wfusync_wait);
++DECL_HANDLER(wake_wfusync_waiters);
++DECL_HANDLER(try_wait_all_wfusync);
+ DECL_HANDLER(get_inproc_alert_fd);
+ DECL_HANDLER(d3dkmt_object_create);
+ DECL_HANDLER(d3dkmt_object_update);
+@@ -616,6 +621,11 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_get_next_thread,
+     (req_handler)req_set_keyboard_repeat,
+     (req_handler)req_get_inproc_sync_fd,
++    (req_handler)req_get_wfusync_wait_slot,
++    (req_handler)req_register_wfusync_wait,
++    (req_handler)req_unregister_wfusync_wait,
++    (req_handler)req_wake_wfusync_waiters,
++    (req_handler)req_try_wait_all_wfusync,
+     (req_handler)req_get_inproc_alert_fd,
+     (req_handler)req_d3dkmt_object_create,
+     (req_handler)req_d3dkmt_object_update,
+@@ -2328,7 +2338,20 @@ C_ASSERT( offsetof(struct get_inproc_sync_fd_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
+-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 16 );
++C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
++C_ASSERT( sizeof(struct get_wfusync_wait_slot_request) == 16 );
++C_ASSERT( offsetof(struct get_wfusync_wait_slot_reply, shm_idx) == 8 );
++C_ASSERT( sizeof(struct get_wfusync_wait_slot_reply) == 16 );
++C_ASSERT( offsetof(struct register_wfusync_wait_request, slot_idx) == 12 );
++C_ASSERT( sizeof(struct register_wfusync_wait_request) == 16 );
++C_ASSERT( offsetof(struct unregister_wfusync_wait_request, slot_idx) == 12 );
++C_ASSERT( sizeof(struct unregister_wfusync_wait_request) == 16 );
++C_ASSERT( offsetof(struct wake_wfusync_waiters_request, shm_idx) == 12 );
++C_ASSERT( sizeof(struct wake_wfusync_waiters_request) == 16 );
++C_ASSERT( offsetof(struct try_wait_all_wfusync_request, tid) == 12 );
++C_ASSERT( offsetof(struct try_wait_all_wfusync_request, slot_idx) == 16 );
++C_ASSERT( sizeof(struct try_wait_all_wfusync_request) == 24 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 7d1a1c4..0f024cd 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3411,6 +3411,39 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
+ {
+     fprintf( stderr, " type=%d", req->type );
+     fprintf( stderr, ", access=%08x", req->access );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_get_wfusync_wait_slot_request( const struct get_wfusync_wait_slot_request *req )
++{
++}
++
++static void dump_get_wfusync_wait_slot_reply( const struct get_wfusync_wait_slot_reply *req )
++{
++    fprintf( stderr, " shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_register_wfusync_wait_request( const struct register_wfusync_wait_request *req )
++{
++    fprintf( stderr, " slot_idx=%08x", req->slot_idx );
++    dump_varargs_uints( ", shm_idxs=", cur_size );
++}
++
++static void dump_unregister_wfusync_wait_request( const struct unregister_wfusync_wait_request *req )
++{
++    fprintf( stderr, " slot_idx=%08x", req->slot_idx );
++}
++
++static void dump_wake_wfusync_waiters_request( const struct wake_wfusync_waiters_request *req )
++{
++    fprintf( stderr, " shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_try_wait_all_wfusync_request( const struct try_wait_all_wfusync_request *req )
++{
++    fprintf( stderr, " tid=%04x", req->tid );
++    fprintf( stderr, ", slot_idx=%08x", req->slot_idx );
++    dump_varargs_uints( ", entries=", cur_size );
+ }
+ 
+ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
+@@ -3826,6 +3859,11 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_next_thread_request,
+     (dump_func)dump_set_keyboard_repeat_request,
+     (dump_func)dump_get_inproc_sync_fd_request,
++    (dump_func)dump_get_wfusync_wait_slot_request,
++    (dump_func)dump_register_wfusync_wait_request,
++    (dump_func)dump_unregister_wfusync_wait_request,
++    (dump_func)dump_wake_wfusync_waiters_request,
++    (dump_func)dump_try_wait_all_wfusync_request,
+     (dump_func)dump_get_inproc_alert_fd_request,
+     (dump_func)dump_d3dkmt_object_create_request,
+     (dump_func)dump_d3dkmt_object_update_request,
+@@ -4137,6 +4175,11 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_next_thread_reply,
+     (dump_func)dump_set_keyboard_repeat_reply,
+     (dump_func)dump_get_inproc_sync_fd_reply,
++    (dump_func)dump_get_wfusync_wait_slot_reply,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
+     (dump_func)dump_get_inproc_alert_fd_reply,
+     (dump_func)dump_d3dkmt_object_create_reply,
+     NULL,
+@@ -4448,6 +4491,11 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "get_next_thread",
+     "set_keyboard_repeat",
+     "get_inproc_sync_fd",
++    "get_wfusync_wait_slot",
++    "register_wfusync_wait",
++    "unregister_wfusync_wait",
++    "wake_wfusync_waiters",
++    "try_wait_all_wfusync",
+     "get_inproc_alert_fd",
+     "d3dkmt_object_create",
+     "d3dkmt_object_update",
+diff --git a/server/semaphore.c b/server/semaphore.c
+index 4c36000..eb9d79a 100644
+--- a/server/semaphore.c
++++ b/server/semaphore.c
+@@ -34,6 +34,7 @@
+ #include "thread.h"
+ #include "request.h"
+ #include "security.h"
++#include "wfusync.h"
+ 
+ static const WCHAR semaphore_name[] = {'S','e','m','a','p','h','o','r','e'};
+ 
+@@ -54,19 +55,25 @@ struct semaphore_sync
+     struct object       obj;                /* object header */
+     unsigned int        count;              /* current count */
+     unsigned int        max;                /* maximum possible count */
++#ifdef __APPLE__
++    struct wfusync     *wfusync;            /* optional shared fast-path state */
++#endif
+ };
+ 
+ static void semaphore_sync_dump( struct object *obj, int verbose );
++static int semaphore_sync_add_queue( struct object *obj, struct wait_queue_entry *entry );
++static void semaphore_sync_remove_queue( struct object *obj, struct wait_queue_entry *entry );
+ static int semaphore_sync_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static void semaphore_sync_satisfied( struct object *obj, struct wait_queue_entry *entry );
++static void semaphore_sync_destroy( struct object *obj );
+ 
+ static const struct object_ops semaphore_sync_ops =
+ {
+     sizeof(struct semaphore_sync), /* size */
+     &no_type,                      /* type */
+     semaphore_sync_dump,           /* dump */
+-    add_queue,                     /* add_queue */
+-    remove_queue,                  /* remove_queue */
++    semaphore_sync_add_queue,      /* add_queue */
++    semaphore_sync_remove_queue,   /* remove_queue */
+     semaphore_sync_signaled,       /* signaled */
+     semaphore_sync_satisfied,      /* satisfied */
+     no_signal,                     /* signal */
+@@ -82,12 +89,28 @@ static const struct object_ops semaphore_sync_ops =
+     no_open_file,                  /* open_file */
+     no_kernel_obj_list,            /* get_kernel_obj_list */
+     no_close_handle,               /* close_handle */
+-    no_destroy                     /* destroy */
++    semaphore_sync_destroy         /* destroy */
+ };
+ 
+ static int release_semaphore( struct semaphore_sync *sem, unsigned int count,
+                               unsigned int *prev )
+ {
++#ifdef __APPLE__
++    if (sem->wfusync)
++    {
++        unsigned int old_count;
++
++        if (!wfusync_release_semaphore( sem->wfusync, count, &old_count )) return 0;
++        if (prev) *prev = old_count;
++        if (!old_count)
++        {
++            wake_up( &sem->obj, count );
++            wfusync_wake_waiters( wfusync_get_index( sem->wfusync ) );
++        }
++        return 1;
++    }
++#endif
++
+     if (prev) *prev = sem->count;
+     if (sem->count + count < sem->count || sem->count + count > sem->max)
+     {
+@@ -114,10 +137,33 @@ static void semaphore_sync_dump( struct object *obj, int verbose )
+     fprintf( stderr, "Semaphore count=%d max=%d\n", sem->count, sem->max );
+ }
+ 
++static int semaphore_sync_add_queue( struct object *obj, struct wait_queue_entry *entry )
++{
++    struct semaphore_sync *sem = (struct semaphore_sync *)obj;
++    assert( obj->ops == &semaphore_sync_ops );
++#ifdef __APPLE__
++    if (sem->wfusync) wfusync_add_server_waiter( sem->wfusync );
++#endif
++    return add_queue( obj, entry );
++}
++
++static void semaphore_sync_remove_queue( struct object *obj, struct wait_queue_entry *entry )
++{
++    struct semaphore_sync *sem = (struct semaphore_sync *)obj;
++    assert( obj->ops == &semaphore_sync_ops );
++#ifdef __APPLE__
++    if (sem->wfusync) wfusync_remove_server_waiter( sem->wfusync );
++#endif
++    remove_queue( obj, entry );
++}
++
+ static int semaphore_sync_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct semaphore_sync *sem = (struct semaphore_sync *)obj;
+     assert( obj->ops == &semaphore_sync_ops );
++#ifdef __APPLE__
++    if (sem->wfusync) return wfusync_semaphore_signaled( sem->wfusync );
++#endif
+     return (sem->count > 0);
+ }
+ 
+@@ -125,22 +171,42 @@ static void semaphore_sync_satisfied( struct object *obj, struct wait_queue_entr
+ {
+     struct semaphore_sync *sem = (struct semaphore_sync *)obj;
+     assert( obj->ops == &semaphore_sync_ops );
++#ifdef __APPLE__
++    if (sem->wfusync)
++    {
++        wfusync_semaphore_satisfied( sem->wfusync );
++        return;
++    }
++#endif
+     assert( sem->count );
+     sem->count--;
+ }
+ 
+-static struct object *create_semaphore_sync( unsigned int initial, unsigned int max )
++static struct object *create_semaphore_sync( unsigned int initial, unsigned int max, int inproc )
+ {
+     struct semaphore_sync *sem;
+ 
+-    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_semaphore_sync( initial, max );
+-
+     if (!(sem = alloc_object( &semaphore_sync_ops ))) return NULL;
+     sem->count = initial;
+     sem->max   = max;
++#ifdef __APPLE__
++    sem->wfusync = NULL;
++    if (inproc && do_wfusync() &&
++        !(sem->wfusync = create_wfusync( initial, max, INPROC_SYNC_SEMAPHORE )))
++        clear_error();
++#endif
+     return &sem->obj;
+ }
+ 
++static void semaphore_sync_destroy( struct object *obj )
++{
++#ifdef __APPLE__
++    struct semaphore_sync *sem = (struct semaphore_sync *)obj;
++    assert( obj->ops == &semaphore_sync_ops );
++    if (sem->wfusync) wfusync_destroy( sem->wfusync );
++#endif
++}
++
+ struct semaphore
+ {
+     struct object          obj;    /* object header */
+@@ -195,7 +261,7 @@ static struct semaphore *create_semaphore( struct object *root, const struct uni
+             /* initialize it if it didn't already exist */
+             sem->sync = NULL;
+ 
+-            if (!(sem->sync = create_semaphore_sync( initial, max )))
++            if (!(sem->sync = create_semaphore_sync( initial, max, 1 )))
+             {
+                 release_object( sem );
+                 return NULL;
+@@ -242,6 +308,25 @@ static void semaphore_destroy( struct object *obj )
+     if (sem->sync) release_object( sem->sync );
+ }
+ 
++int get_semaphore_wfusync_idx( struct object *obj, int *type )
++{
++#ifdef __APPLE__
++    struct semaphore_sync *sync;
++    struct semaphore *sem;
++
++    if (!do_wfusync() || !obj || obj->ops != &semaphore_ops) return -1;
++    sem = (struct semaphore *)obj;
++    if (!sem->sync || sem->sync->ops != &semaphore_sync_ops) return -1;
++    sync = (struct semaphore_sync *)sem->sync;
++    if (!sync->wfusync) return -1;
++    wfusync_grab_object( sync->wfusync );
++    *type = INPROC_SYNC_SEMAPHORE;
++    return wfusync_get_index( sync->wfusync );
++#else
++    return -1;
++#endif
++}
++
+ /* create a semaphore */
+ DECL_HANDLER(create_semaphore)
+ {
+@@ -302,8 +387,14 @@ DECL_HANDLER(query_semaphore)
+         struct semaphore_sync *sync = (struct semaphore_sync *)sem->sync;
+         assert( sem->sync->ops == &semaphore_sync_ops ); /* never called with inproc syncs */
+ 
+-        reply->current = sync->count;
+-        reply->max = sync->max;
++#ifdef __APPLE__
++        if (sync->wfusync) wfusync_get_semaphore_state( sync->wfusync, &reply->current, &reply->max );
++        else
++#endif
++        {
++            reply->current = sync->count;
++            reply->max = sync->max;
++        }
+         release_object( sem );
+     }
+ }
+diff --git a/server/wfusync.c b/server/wfusync.c
+new file mode 100644
+index 0000000..12f9655
+--- /dev/null
++++ b/server/wfusync.c
+@@ -0,0 +1,1028 @@
++/*
++ * WineForge userspace synchronization server state
++ *
++ * Copyright (C) 2026 Radim Vesely
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <stdlib.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "winternl.h"
++
++#include "request.h"
++#include "wfusync.h"
++
++int do_wfusync(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1) enabled = getenv( "WINEWFUSYNC" ) && atoi( getenv( "WINEWFUSYNC" ) );
++    return enabled;
++}
++
++#ifdef __APPLE__
++
++#include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <AvailabilityMacros.h>
++#ifdef MAC_OS_VERSION_14_4
++# include <os/os_sync_wait_on_address.h>
++#endif
++
++#define UL_COMPARE_AND_WAIT_SHARED 3
++#define ULF_WAKE_ALL               0x00000100
++#define WFUSYNC_TYPE_MASK          0x1fff
++#define WFUSYNC_STATE_LOCKED       0x2000
++#define WFUSYNC_MULTI_WAITERS      0x4000
++#define WFUSYNC_SERVER_WAITERS     0x8000
++
++extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
++
++struct wfusync_state
++{
++    int            low;
++    int            high;
++    unsigned int   generation;
++    unsigned short type;
++    unsigned short refcount;
++};
++
++struct wfusync
++{
++    unsigned int shm_idx;
++    unsigned int server_waiters;
++};
++
++struct wfusync_waiter
++{
++    unsigned int slot_idx;
++    unsigned int count;
++    unsigned int *shm_idxs;
++    struct wfusync_waiter *next;
++};
++
++static void **wfusync_pages;
++static unsigned int wfusync_pages_count;
++static unsigned int next_shm_idx = 1;
++static unsigned int next_generation = 1;
++static int shared_fd = -1;
++static long page_size;
++static struct wfusync_waiter *wfusync_waiters;
++static unsigned int *wfusync_multi_waiter_counts;
++static unsigned int wfusync_multi_waiter_counts_count;
++
++static long get_page_size(void)
++{
++    if (!page_size) page_size = sysconf( _SC_PAGESIZE );
++    return page_size;
++}
++
++static void wake_address( int *addr, int wake_all )
++{
++#ifdef MAC_OS_VERSION_14_4
++    if (__builtin_available( macOS 14.4, * ))
++    {
++        if (wake_all) os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        else os_sync_wake_by_address_any( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        return;
++    }
++#endif
++    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | (wake_all ? ULF_WAKE_ALL : 0), addr, 0 );
++}
++
++static struct wfusync_state *get_state( unsigned int idx )
++{
++    unsigned int entry = (idx * sizeof(struct wfusync_state)) / get_page_size();
++    unsigned int offset = (idx * sizeof(struct wfusync_state)) % get_page_size();
++
++    if (entry >= wfusync_pages_count || !wfusync_pages[entry]) return NULL;
++    return (struct wfusync_state *)((char *)wfusync_pages[entry] + offset);
++}
++
++static unsigned short get_state_type( struct wfusync_state *state )
++{
++    return __atomic_load_n( &state->type, __ATOMIC_SEQ_CST ) & WFUSYNC_TYPE_MASK;
++}
++
++static int lock_state( struct wfusync_state *state, unsigned short expected_type )
++{
++    unsigned int attempts = 0;
++    unsigned short type;
++
++    for (;;)
++    {
++        type = __atomic_load_n( &state->type, __ATOMIC_SEQ_CST );
++        if ((type & WFUSYNC_TYPE_MASK) != expected_type) return 0;
++        if (!(type & WFUSYNC_STATE_LOCKED) &&
++            __atomic_compare_exchange_n( &state->type, &type, type | WFUSYNC_STATE_LOCKED, FALSE,
++                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++            return 1;
++        if (!(++attempts % 64)) sched_yield();
++    }
++}
++
++static void unlock_state( struct wfusync_state *state )
++{
++    __atomic_fetch_and( &state->type, ~WFUSYNC_STATE_LOCKED, __ATOMIC_SEQ_CST );
++}
++
++int wfusync_get_shared_fd(void)
++{
++    char name[64];
++    unsigned int attempt;
++
++    if (shared_fd != -1) return shared_fd;
++
++    for (attempt = 0; attempt < 16; attempt++)
++    {
++        snprintf( name, sizeof(name), "/wine-wfusync-%x-%x", getpid(), arc4random() );
++        shared_fd = shm_open( name, O_RDWR | O_CREAT | O_EXCL, 0600 );
++        if (shared_fd != -1) break;
++        if (errno != EEXIST) return -1;
++    }
++    if (shared_fd == -1) return -1;
++    if (shm_unlink( name ) == -1)
++    {
++        close( shared_fd );
++        shared_fd = -1;
++        return -1;
++    }
++
++    fcntl( shared_fd, F_SETFD, FD_CLOEXEC );
++    return shared_fd;
++}
++
++static int ensure_shared_file_size( unsigned int pages )
++{
++    off_t size = (off_t)pages * get_page_size();
++    int fd = wfusync_get_shared_fd();
++
++    if (fd == -1) return 0;
++    return ftruncate( fd, size ) != -1;
++}
++
++static struct wfusync_state *alloc_state_slot( unsigned int *idx )
++{
++    struct wfusync_state *state;
++    unsigned int entry, offset;
++    void *page;
++
++    *idx = next_shm_idx++;
++    entry = (*idx * sizeof(struct wfusync_state)) / get_page_size();
++    offset = (*idx * sizeof(struct wfusync_state)) % get_page_size();
++
++    if (entry >= wfusync_pages_count)
++    {
++        unsigned int new_count = wfusync_pages_count ? wfusync_pages_count * 2 : 16;
++        void **new_pages;
++
++        while (entry >= new_count) new_count *= 2;
++        if (!(new_pages = realloc( wfusync_pages, new_count * sizeof(*wfusync_pages) ))) return NULL;
++        memset( new_pages + wfusync_pages_count, 0, (new_count - wfusync_pages_count) * sizeof(*wfusync_pages) );
++        wfusync_pages = new_pages;
++        wfusync_pages_count = new_count;
++    }
++
++    if (!wfusync_pages[entry])
++    {
++        if (!ensure_shared_file_size( entry + 1 )) return NULL;
++        page = mmap( NULL, get_page_size(), PROT_READ | PROT_WRITE, MAP_SHARED,
++                     wfusync_get_shared_fd(), (off_t)entry * get_page_size() );
++        if (page == MAP_FAILED) return NULL;
++        wfusync_pages[entry] = page;
++    }
++
++    state = (struct wfusync_state *)((char *)wfusync_pages[entry] + offset);
++    memset( state, 0, sizeof(*state) );
++    return state;
++}
++
++struct wfusync *create_wfusync( int low, int high, enum inproc_sync_type type )
++{
++    struct wfusync_state *state;
++    struct wfusync *sync;
++
++    if (!(sync = mem_alloc( sizeof(*sync) ))) return NULL;
++    if (!(state = alloc_state_slot( &sync->shm_idx )))
++    {
++        free( sync );
++        return NULL;
++    }
++
++    state->low = low;
++    state->high = high;
++    state->generation = next_generation++;
++    state->type = type;
++    state->refcount = 1; /* server-owned object reference */
++    sync->server_waiters = 0;
++
++    return sync;
++}
++
++unsigned int wfusync_get_index( struct wfusync *sync )
++{
++    return sync ? sync->shm_idx : 0;
++}
++
++static void wake_wait_slot( struct wfusync_state *slot )
++{
++    __atomic_store_n( &slot->low, 0, __ATOMIC_SEQ_CST );
++    wake_address( &slot->low, 1 );
++}
++
++static int ensure_multi_waiter_count( unsigned int shm_idx )
++{
++    unsigned int new_count;
++    unsigned int *new_counts;
++
++    if (shm_idx < wfusync_multi_waiter_counts_count) return 1;
++
++    new_count = wfusync_multi_waiter_counts_count ? wfusync_multi_waiter_counts_count * 2 : 256;
++    while (shm_idx >= new_count) new_count *= 2;
++
++    if (!(new_counts = realloc( wfusync_multi_waiter_counts, new_count * sizeof(*new_counts) ))) return 0;
++    memset( new_counts + wfusync_multi_waiter_counts_count, 0,
++            (new_count - wfusync_multi_waiter_counts_count) * sizeof(*new_counts) );
++    wfusync_multi_waiter_counts = new_counts;
++    wfusync_multi_waiter_counts_count = new_count;
++    return 1;
++}
++
++static int add_multi_waiter( unsigned int shm_idx )
++{
++    struct wfusync_state *state = get_state( shm_idx );
++
++    if (!state) return 0;
++    switch (get_state_type( state ))
++    {
++    case INPROC_SYNC_EVENT:
++    case INPROC_SYNC_SEMAPHORE:
++    case INPROC_SYNC_MUTEX:
++        break;
++    default:
++        return 0;
++    }
++    if (!ensure_multi_waiter_count( shm_idx )) return 0;
++
++    wfusync_multi_waiter_counts[shm_idx]++;
++    __atomic_fetch_or( &state->type, WFUSYNC_MULTI_WAITERS, __ATOMIC_SEQ_CST );
++    return 1;
++}
++
++static void remove_multi_waiter( unsigned int shm_idx )
++{
++    struct wfusync_state *state = get_state( shm_idx );
++
++    if (!state || shm_idx >= wfusync_multi_waiter_counts_count || !wfusync_multi_waiter_counts[shm_idx]) return;
++
++    if (--wfusync_multi_waiter_counts[shm_idx]) return;
++    __atomic_fetch_and( &state->type, ~WFUSYNC_MULTI_WAITERS, __ATOMIC_SEQ_CST );
++}
++
++static void remove_waiter( unsigned int slot_idx )
++{
++    struct wfusync_waiter **ptr = &wfusync_waiters;
++
++    while (*ptr)
++    {
++        struct wfusync_waiter *waiter = *ptr;
++
++        if (waiter->slot_idx == slot_idx)
++        {
++            unsigned int i;
++
++            *ptr = waiter->next;
++            for (i = 0; i < waiter->count; i++) remove_multi_waiter( waiter->shm_idxs[i] );
++            free( waiter->shm_idxs );
++            free( waiter );
++            continue;
++        }
++        ptr = &waiter->next;
++    }
++}
++
++static int wfusync_state_signaled( unsigned int shm_idx )
++{
++    struct wfusync_state *state = get_state( shm_idx );
++    int owner;
++
++    if (!state) return 0;
++
++    switch (get_state_type( state ))
++    {
++    case INPROC_SYNC_EVENT:
++        return __atomic_load_n( &state->low, __ATOMIC_SEQ_CST ) != 0;
++    case INPROC_SYNC_SEMAPHORE:
++        return __atomic_load_n( &state->low, __ATOMIC_SEQ_CST ) > 0;
++    case INPROC_SYNC_MUTEX:
++        owner = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++        return !owner || owner < 0;
++    default:
++        return 0;
++    }
++}
++
++static void wake_waiters_for_object( unsigned int shm_idx )
++{
++    struct wfusync_waiter *waiter;
++
++    for (waiter = wfusync_waiters; waiter; waiter = waiter->next)
++    {
++        struct wfusync_state *slot;
++        unsigned int i;
++
++        for (i = 0; i < waiter->count; i++)
++        {
++            if (waiter->shm_idxs[i] != shm_idx) continue;
++            if ((slot = get_state( waiter->slot_idx ))) wake_wait_slot( slot );
++            break;
++        }
++    }
++}
++
++unsigned int wfusync_alloc_wait_slot(void)
++{
++    struct wfusync_state *state;
++    unsigned int shm_idx;
++
++    if (!(state = alloc_state_slot( &shm_idx ))) return 0;
++
++    state->low = 0;
++    state->high = 0;
++    state->generation = next_generation++;
++    state->type = INPROC_SYNC_INTERNAL;
++    state->refcount = 1;
++
++    return shm_idx;
++}
++
++int wfusync_register_wait( unsigned int slot_idx, const unsigned int *shm_idxs, unsigned int count )
++{
++    struct wfusync_waiter *waiter;
++    struct wfusync_state *slot = get_state( slot_idx );
++    unsigned int i;
++
++    if (!slot || get_state_type( slot ) != INPROC_SYNC_INTERNAL || !count || count > 64) return 0;
++
++    remove_waiter( slot_idx );
++
++    __atomic_store_n( &slot->low, 1, __ATOMIC_SEQ_CST );
++    slot->generation = next_generation++;
++
++    for (i = 0; i < count; i++)
++    {
++        struct wfusync_state *state = get_state( shm_idxs[i] );
++
++        if (!state)
++        {
++            wake_wait_slot( slot );
++            return 0;
++        }
++        switch (get_state_type( state ))
++        {
++        case INPROC_SYNC_EVENT:
++        case INPROC_SYNC_SEMAPHORE:
++        case INPROC_SYNC_MUTEX:
++            break;
++        default:
++            wake_wait_slot( slot );
++            return 0;
++        }
++    }
++
++    if (!(waiter = mem_alloc( sizeof(*waiter) )))
++    {
++        wake_wait_slot( slot );
++        return 0;
++    }
++    if (!(waiter->shm_idxs = mem_alloc( count * sizeof(*waiter->shm_idxs) )))
++    {
++        free( waiter );
++        wake_wait_slot( slot );
++        return 0;
++    }
++
++    memcpy( waiter->shm_idxs, shm_idxs, count * sizeof(*waiter->shm_idxs) );
++    waiter->slot_idx = slot_idx;
++    waiter->count = count;
++
++    for (i = 0; i < count; i++)
++    {
++        if (!add_multi_waiter( shm_idxs[i] ))
++        {
++            while (i) remove_multi_waiter( shm_idxs[--i] );
++            free( waiter->shm_idxs );
++            free( waiter );
++            wake_wait_slot( slot );
++            return 0;
++        }
++    }
++
++    waiter->next = wfusync_waiters;
++    wfusync_waiters = waiter;
++
++    for (i = 0; i < count; i++)
++    {
++        if (wfusync_state_signaled( shm_idxs[i] ))
++        {
++            wake_wait_slot( slot );
++            break;
++        }
++    }
++    return 1;
++}
++
++void wfusync_unregister_wait( unsigned int slot_idx )
++{
++    struct wfusync_state *slot;
++
++    remove_waiter( slot_idx );
++    if ((slot = get_state( slot_idx ))) wake_wait_slot( slot );
++}
++
++int wfusync_wake_waiters( unsigned int shm_idx )
++{
++    if (!get_state( shm_idx )) return 0;
++    wake_waiters_for_object( shm_idx );
++    return 1;
++}
++
++void wfusync_grab_object( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return;
++    assert( state->refcount );
++    state->refcount++;
++}
++
++void wfusync_destroy( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++
++    if (!sync) return;
++    if ((state = get_state( sync->shm_idx )))
++    {
++        assert( state->refcount );
++        __atomic_store_n( &state->type, INPROC_SYNC_UNKNOWN, __ATOMIC_SEQ_CST );
++        state->generation = next_generation++;
++        state->refcount--;
++    }
++    free( sync );
++}
++
++void wfusync_add_server_waiter( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return;
++    sync->server_waiters++;
++    __atomic_fetch_or( &state->type, WFUSYNC_SERVER_WAITERS, __ATOMIC_SEQ_CST );
++}
++
++void wfusync_remove_server_waiter( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++
++    if (!sync || !sync->server_waiters || !(state = get_state( sync->shm_idx ))) return;
++    if (--sync->server_waiters) return;
++    __atomic_fetch_and( &state->type, (unsigned short)~WFUSYNC_SERVER_WAITERS, __ATOMIC_SEQ_CST );
++}
++
++int wfusync_get_event_state( struct wfusync *sync, int *manual, int *signaled )
++{
++    struct wfusync_state *state;
++    unsigned short type;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    type = get_state_type( state );
++    if ((type != INPROC_SYNC_EVENT && type != INPROC_SYNC_INTERNAL) || !lock_state( state, type )) return 0;
++
++    if (manual) *manual = state->high;
++    if (signaled) *signaled = state->low;
++    unlock_state( state );
++    return 1;
++}
++
++int wfusync_event_signaled( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++    unsigned short type;
++    int signaled;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    type = get_state_type( state );
++    if ((type != INPROC_SYNC_EVENT && type != INPROC_SYNC_INTERNAL) || !lock_state( state, type )) return 0;
++    signaled = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST ) != 0;
++    unlock_state( state );
++    return signaled;
++}
++
++void wfusync_event_satisfied( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++    unsigned short type;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return;
++    type = get_state_type( state );
++    if ((type != INPROC_SYNC_EVENT && type != INPROC_SYNC_INTERNAL) || !lock_state( state, type )) return;
++    if (!state->high) __atomic_store_n( &state->low, 0, __ATOMIC_SEQ_CST );
++    unlock_state( state );
++}
++
++void wfusync_set_event( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++    unsigned short type;
++    int previous;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return;
++    type = get_state_type( state );
++    if ((type != INPROC_SYNC_EVENT && type != INPROC_SYNC_INTERNAL) || !lock_state( state, type )) return;
++    previous = __atomic_exchange_n( &state->low, 1, __ATOMIC_SEQ_CST );
++    unlock_state( state );
++    if (!previous) wake_address( &state->low, state->high );
++    wake_waiters_for_object( sync->shm_idx );
++}
++
++void wfusync_reset_event( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++    unsigned short type;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return;
++    type = get_state_type( state );
++    if ((type != INPROC_SYNC_EVENT && type != INPROC_SYNC_INTERNAL) || !lock_state( state, type )) return;
++    __atomic_store_n( &state->low, 0, __ATOMIC_SEQ_CST );
++    unlock_state( state );
++}
++
++int wfusync_semaphore_signaled( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++    int signaled;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_SEMAPHORE )) return 0;
++    signaled = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST ) > 0;
++    unlock_state( state );
++    return signaled;
++}
++
++void wfusync_semaphore_satisfied( struct wfusync *sync )
++{
++    struct wfusync_state *state;
++    int count;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return;
++    if (!lock_state( state, INPROC_SYNC_SEMAPHORE )) return;
++
++    do
++    {
++        count = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++        if (count <= 0)
++        {
++            unlock_state( state );
++            return;
++        }
++    } while (!__atomic_compare_exchange_n( &state->low, &count, count - 1, FALSE,
++                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
++    unlock_state( state );
++}
++
++int wfusync_release_semaphore( struct wfusync *sync, unsigned int count, unsigned int *prev )
++{
++    struct wfusync_state *state;
++    int old_count, new_count;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_SEMAPHORE )) return 0;
++
++    do
++    {
++        old_count = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++        if ((unsigned int)old_count + count < (unsigned int)old_count ||
++            (unsigned int)old_count + count > (unsigned int)state->high)
++        {
++            set_error( STATUS_SEMAPHORE_LIMIT_EXCEEDED );
++            unlock_state( state );
++            return 0;
++        }
++        new_count = old_count + count;
++    } while (!__atomic_compare_exchange_n( &state->low, &old_count, new_count, FALSE,
++                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
++
++    if (prev) *prev = old_count;
++    unlock_state( state );
++    if (!old_count) wake_address( &state->low, count > 1 );
++    return 1;
++}
++
++int wfusync_get_semaphore_state( struct wfusync *sync, unsigned int *count, unsigned int *max )
++{
++    struct wfusync_state *state;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_SEMAPHORE )) return 0;
++
++    if (count) *count = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++    if (max) *max = state->high;
++    unlock_state( state );
++    return 1;
++}
++
++int wfusync_mutex_signaled( struct wfusync *sync, thread_id_t tid )
++{
++    struct wfusync_state *state;
++    int owner, signaled;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_MUTEX )) return 0;
++
++    owner = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++    signaled = !owner || owner == (int)tid || owner < 0;
++    unlock_state( state );
++    return signaled;
++}
++
++int wfusync_mutex_satisfied( struct wfusync *sync, thread_id_t tid, int *abandoned )
++{
++    struct wfusync_state *state;
++    int owner, count;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_MUTEX )) return 0;
++
++    owner = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++    count = __atomic_load_n( &state->high, __ATOMIC_SEQ_CST );
++
++    if (owner == (int)tid)
++    {
++        __atomic_store_n( &state->high, count + 1, __ATOMIC_SEQ_CST );
++        if (abandoned) *abandoned = 0;
++        unlock_state( state );
++        return 1;
++    }
++
++    if (!owner || owner < 0)
++    {
++        __atomic_store_n( &state->low, (int)tid, __ATOMIC_SEQ_CST );
++        __atomic_store_n( &state->high, 1, __ATOMIC_SEQ_CST );
++        if (owner < 0) state->generation++;
++        if (abandoned) *abandoned = owner < 0;
++        unlock_state( state );
++        return 1;
++    }
++
++    unlock_state( state );
++    return 0;
++}
++
++int wfusync_release_mutex( struct wfusync *sync, thread_id_t tid, unsigned int *prev )
++{
++    struct wfusync_state *state;
++    int count;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_MUTEX )) return 0;
++    if (__atomic_load_n( &state->low, __ATOMIC_SEQ_CST ) != (int)tid ||
++        !(count = __atomic_load_n( &state->high, __ATOMIC_SEQ_CST )))
++    {
++        set_error( STATUS_MUTANT_NOT_OWNED );
++        unlock_state( state );
++        return 0;
++    }
++
++    if (prev) *prev = count;
++    if (count > 1)
++    {
++        __atomic_store_n( &state->high, count - 1, __ATOMIC_SEQ_CST );
++        unlock_state( state );
++        return 1;
++    }
++
++    __atomic_store_n( &state->high, 0, __ATOMIC_SEQ_CST );
++    __atomic_store_n( &state->low, 0, __ATOMIC_SEQ_CST );
++    unlock_state( state );
++    wake_address( &state->low, 0 );
++    return 1;
++}
++
++int wfusync_get_mutex_state( struct wfusync *sync, thread_id_t tid, unsigned int *count,
++                             int *owned, int *abandoned )
++{
++    struct wfusync_state *state;
++    int owner;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_MUTEX )) return 0;
++
++    owner = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++    if (count) *count = owner < 0 ? 0 : __atomic_load_n( &state->high, __ATOMIC_SEQ_CST );
++    if (owned) *owned = owner == (int)tid;
++    if (abandoned) *abandoned = owner < 0;
++    unlock_state( state );
++    return 1;
++}
++
++int wfusync_abandon_mutex( struct wfusync *sync, thread_id_t tid )
++{
++    struct wfusync_state *state;
++
++    if (!sync || !(state = get_state( sync->shm_idx ))) return 0;
++    if (!lock_state( state, INPROC_SYNC_MUTEX )) return 0;
++    if (state->low != (int)tid || !state->high)
++    {
++        unlock_state( state );
++        return 0;
++    }
++
++    state->low = -(int)tid;
++    state->high = 0;
++    state->generation++;
++    unlock_state( state );
++    wake_address( &state->low, 1 );
++    return 1;
++}
++
++unsigned int wfusync_try_wait_all( const unsigned int *entries, unsigned int count, thread_id_t tid )
++{
++    struct wfusync_state *states[64];
++    unsigned int i, guarded = 0;
++    unsigned int status = STATUS_NOT_IMPLEMENTED;
++    int abandoned = 0;
++
++    if (!count || count > ARRAY_SIZE(states)) return STATUS_NOT_IMPLEMENTED;
++
++    for (i = 0; i < count; i++)
++    {
++        unsigned int shm_idx = entries[i * 3];
++        unsigned int generation = entries[i * 3 + 1];
++        unsigned int type = entries[i * 3 + 2];
++        struct wfusync_state *state = get_state( shm_idx );
++        unsigned short state_type;
++
++        if (!state) goto done;
++        state_type = __atomic_load_n( &state->type, __ATOMIC_SEQ_CST );
++        if ((state_type & (WFUSYNC_STATE_LOCKED | WFUSYNC_SERVER_WAITERS)) ||
++            (state_type & WFUSYNC_TYPE_MASK) != type ||
++            __atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation)
++            goto done;
++
++        if (!__atomic_compare_exchange_n( &state->type, &state_type,
++                                          state_type | WFUSYNC_SERVER_WAITERS, FALSE,
++                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++            goto done;
++        states[guarded++] = state;
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        unsigned int generation = entries[i * 3 + 1];
++        unsigned int type = entries[i * 3 + 2];
++        struct wfusync_state *state = states[i];
++        unsigned short state_type;
++        int low;
++
++        state_type = __atomic_load_n( &state->type, __ATOMIC_SEQ_CST );
++        if ((state_type & WFUSYNC_TYPE_MASK) != type ||
++            __atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation)
++            goto done;
++
++        low = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++        switch (type)
++        {
++        case INPROC_SYNC_EVENT:
++            if (!low)
++            {
++                status = STATUS_TIMEOUT;
++                goto done;
++            }
++            break;
++        case INPROC_SYNC_SEMAPHORE:
++            if (low <= 0)
++            {
++                status = STATUS_TIMEOUT;
++                goto done;
++            }
++            break;
++        case INPROC_SYNC_MUTEX:
++            if (low && low != (int)tid && low > 0)
++            {
++                status = STATUS_TIMEOUT;
++                goto done;
++            }
++            if (low == (int)tid && __atomic_load_n( &state->high, __ATOMIC_SEQ_CST ) == INT_MAX)
++                goto done;
++            if (low < 0) abandoned = 1;
++            break;
++        default:
++            goto done;
++        }
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        struct wfusync_state *state = states[i];
++        unsigned int type = entries[i * 3 + 2];
++
++        switch (type)
++        {
++        case INPROC_SYNC_EVENT:
++            if (!state->low) goto done;
++            if (!state->high) state->low = 0;
++            break;
++        case INPROC_SYNC_SEMAPHORE:
++            if (state->low <= 0) goto done;
++            state->low--;
++            break;
++        case INPROC_SYNC_MUTEX:
++            if (state->low == (int)tid)
++            {
++                if (state->high == INT_MAX) goto done;
++                state->high++;
++            }
++            else if (!state->low || state->low < 0)
++            {
++                if (state->low < 0) state->generation++;
++                state->low = tid;
++                state->high = 1;
++            }
++            else goto done;
++            break;
++        }
++    }
++
++    status = abandoned ? STATUS_ABANDONED_WAIT_0 : STATUS_WAIT_0;
++
++done:
++    for (i = 0; i < guarded; i++)
++        __atomic_fetch_and( &states[i]->type, (unsigned short)~WFUSYNC_SERVER_WAITERS, __ATOMIC_SEQ_CST );
++    return status;
++}
++
++static int get_wait_all_unsignaled( const unsigned int *entries, unsigned int count, thread_id_t tid,
++                                    unsigned int *shm_idxs, unsigned int *wait_count )
++{
++    unsigned int i;
++
++    *wait_count = 0;
++    for (i = 0; i < count; i++)
++    {
++        unsigned int shm_idx = entries[i * 3];
++        unsigned int generation = entries[i * 3 + 1];
++        unsigned int type = entries[i * 3 + 2];
++        struct wfusync_state *state = get_state( shm_idx );
++        unsigned short state_type;
++        int low;
++
++        if (!state) return 0;
++        state_type = __atomic_load_n( &state->type, __ATOMIC_SEQ_CST );
++        if ((state_type & (WFUSYNC_STATE_LOCKED | WFUSYNC_SERVER_WAITERS)) ||
++            (state_type & WFUSYNC_TYPE_MASK) != type ||
++            __atomic_load_n( &state->generation, __ATOMIC_SEQ_CST ) != generation)
++            return 0;
++
++        low = __atomic_load_n( &state->low, __ATOMIC_SEQ_CST );
++        switch (type)
++        {
++        case INPROC_SYNC_EVENT:
++            if (!low) shm_idxs[(*wait_count)++] = shm_idx;
++            break;
++        case INPROC_SYNC_SEMAPHORE:
++            if (low <= 0) shm_idxs[(*wait_count)++] = shm_idx;
++            break;
++        case INPROC_SYNC_MUTEX:
++            if (low && low != (int)tid && low > 0) shm_idxs[(*wait_count)++] = shm_idx;
++            break;
++        default:
++            return 0;
++        }
++    }
++    return 1;
++}
++
++#endif /* __APPLE__ */
++
++DECL_HANDLER(get_wfusync_wait_slot)
++{
++#ifdef __APPLE__
++    if (!do_wfusync())
++    {
++        set_error( STATUS_NOT_IMPLEMENTED );
++        return;
++    }
++    if (!(reply->shm_idx = wfusync_alloc_wait_slot())) set_error( STATUS_NO_MEMORY );
++#else
++    set_error( STATUS_NOT_IMPLEMENTED );
++#endif
++}
++
++DECL_HANDLER(register_wfusync_wait)
++{
++#ifdef __APPLE__
++    data_size_t size = get_req_data_size();
++
++    if (!do_wfusync() || !size || size % sizeof(unsigned int))
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++    if (!wfusync_register_wait( req->slot_idx, get_req_data(), size / sizeof(unsigned int) ))
++        set_error( STATUS_NOT_IMPLEMENTED );
++#else
++    set_error( STATUS_NOT_IMPLEMENTED );
++#endif
++}
++
++DECL_HANDLER(unregister_wfusync_wait)
++{
++#ifdef __APPLE__
++    if (!do_wfusync())
++    {
++        set_error( STATUS_NOT_IMPLEMENTED );
++        return;
++    }
++    wfusync_unregister_wait( req->slot_idx );
++#else
++    set_error( STATUS_NOT_IMPLEMENTED );
++#endif
++}
++
++DECL_HANDLER(wake_wfusync_waiters)
++{
++#ifdef __APPLE__
++    if (!do_wfusync() || !wfusync_wake_waiters( req->shm_idx ))
++    {
++        set_error( STATUS_NOT_IMPLEMENTED );
++        return;
++    }
++#else
++    set_error( STATUS_NOT_IMPLEMENTED );
++#endif
++}
++
++DECL_HANDLER(try_wait_all_wfusync)
++{
++#ifdef __APPLE__
++    const unsigned int *entries = get_req_data();
++    data_size_t size = get_req_data_size();
++    unsigned int attempts, count, status, wait_count;
++    unsigned int shm_idxs[64];
++
++    if (!do_wfusync() || !size || size % (3 * sizeof(unsigned int)))
++    {
++        set_error( STATUS_NOT_IMPLEMENTED );
++        return;
++    }
++
++    count = size / (3 * sizeof(unsigned int));
++    if (count > ARRAY_SIZE(shm_idxs))
++    {
++        set_error( STATUS_NOT_IMPLEMENTED );
++        return;
++    }
++
++    if (req->slot_idx) wfusync_unregister_wait( req->slot_idx );
++    for (attempts = 0; ; attempts++)
++    {
++        status = wfusync_try_wait_all( entries, count, req->tid );
++        if (status != STATUS_TIMEOUT || !req->slot_idx) break;
++        if (!get_wait_all_unsignaled( entries, count, req->tid, shm_idxs, &wait_count ))
++        {
++            status = STATUS_NOT_IMPLEMENTED;
++            break;
++        }
++        if (wait_count)
++        {
++            status = wfusync_register_wait( req->slot_idx, shm_idxs, wait_count )
++                     ? STATUS_PENDING : STATUS_NOT_IMPLEMENTED;
++            break;
++        }
++        if (attempts == 3)
++        {
++            status = STATUS_NOT_IMPLEMENTED;
++            break;
++        }
++    }
++    if (status) set_error( status );
++#else
++    set_error( STATUS_NOT_IMPLEMENTED );
++#endif
++}
+diff --git a/server/wfusync.h b/server/wfusync.h
+new file mode 100644
+index 0000000..ed001e1
+--- /dev/null
++++ b/server/wfusync.h
+@@ -0,0 +1,46 @@
++/*
++ * WineForge userspace synchronization server state
++ *
++ * Copyright (C) 2026 Radim Vesely
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++extern int do_wfusync(void);
++
++struct wfusync;
++
++#ifdef __APPLE__
++
++extern int wfusync_get_shared_fd(void);
++extern struct wfusync *create_wfusync( int low, int high, enum inproc_sync_type type );
++extern unsigned int wfusync_get_index( struct wfusync *sync );
++extern unsigned int wfusync_alloc_wait_slot(void);
++extern int wfusync_register_wait( unsigned int slot_idx, const unsigned int *shm_idxs, unsigned int count );
++extern void wfusync_unregister_wait( unsigned int slot_idx );
++extern int wfusync_wake_waiters( unsigned int shm_idx );
++extern void wfusync_grab_object( struct wfusync *sync );
++extern void wfusync_destroy( struct wfusync *sync );
++extern void wfusync_add_server_waiter( struct wfusync *sync );
++extern void wfusync_remove_server_waiter( struct wfusync *sync );
++extern int wfusync_get_event_state( struct wfusync *sync, int *manual, int *signaled );
++extern int wfusync_event_signaled( struct wfusync *sync );
++extern void wfusync_event_satisfied( struct wfusync *sync );
++extern void wfusync_set_event( struct wfusync *sync );
++extern void wfusync_reset_event( struct wfusync *sync );
++extern int wfusync_semaphore_signaled( struct wfusync *sync );
++extern void wfusync_semaphore_satisfied( struct wfusync *sync );
++extern int wfusync_release_semaphore( struct wfusync *sync, unsigned int count, unsigned int *prev );
++extern int wfusync_get_semaphore_state( struct wfusync *sync, unsigned int *count, unsigned int *max );
++extern int wfusync_mutex_signaled( struct wfusync *sync, thread_id_t tid );
++extern int wfusync_mutex_satisfied( struct wfusync *sync, thread_id_t tid, int *abandoned );
++extern int wfusync_release_mutex( struct wfusync *sync, thread_id_t tid, unsigned int *prev );
++extern int wfusync_get_mutex_state( struct wfusync *sync, thread_id_t tid, unsigned int *count,
++                                    int *owned, int *abandoned );
++extern int wfusync_abandon_mutex( struct wfusync *sync, thread_id_t tid );
++extern unsigned int wfusync_try_wait_all( const unsigned int *entries, unsigned int count, thread_id_t tid );
++
++#endif /* __APPLE__ */
